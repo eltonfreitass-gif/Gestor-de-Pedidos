@@ -1,0 +1,8 @@
+# Ignorar arquivos temporários do Python e do Streamlit
+__pycache__/
+.streamlit/
+
+# IGNORAR PLANILHAS DE TESTE (Muito importante!)
+# Isso garante que seus arquivos reais de estoque e movimento NÃO subam para a internet
+*.csv
+*.xlsx
