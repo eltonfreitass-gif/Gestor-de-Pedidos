@@ -442,8 +442,8 @@ with st.sidebar:
     dias_pedido = st.number_input("Dias de ressuprimento:", value=15, min_value=1)
 
     hoje        = datetime.now()
-    data_inicio = st.date_input("Início do Histórico:", value=hoje - timedelta(days=5))
-    data_fim    = st.date_input("Fim do Período:",      value=hoje)
+    data_inicio = st.date_input("Início do Histórico:", value=hoje - timedelta(days=5), format="DD/MM/YYYY")
+    data_fim    = st.date_input("Fim do Período:",      value=hoje,                        format="DD/MM/YYYY")
 
 # Inicializa categorias do disco na sessão
 inicializar_categorias_session()
@@ -467,9 +467,11 @@ tab1, tab2 = st.tabs(["⚡ Processar Pedido com IA Logística", "🗂️ Gestão
 with tab2:
     st.subheader("🗂️ Mapeamento Global de Categorias de Insumos")
     st.info(
-        "As categorias aqui definidas são globais — independem da farmácia. "
+        "As categorias aqui definidas são **globais** — independem da farmácia. "
         "Um item classificado como **MEDICAMENTO** será tratado assim em todas as unidades. "
-        "Itens sem consumo ou estoque em uma unidade são automaticamente excluídos da análise."
+        "Itens são excluídos da análise apenas quando não há **consumo registrado no período** "
+        "e **nenhum estoque mínimo parametrizado** — ou seja, itens completamente inativos naquela unidade. "
+        "Itens com estoque mínimo definido, mesmo sem giro recente, continuam visíveis e recebem parecer de alerta ou desabastecimento."
     )
 
     df_cat_session = st.session_state["df_categorias"].copy()
