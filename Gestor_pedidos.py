@@ -68,8 +68,23 @@ CATEGORIAS_PADRAO = sorted([
 ARQUIVO_CATEGORIAS = Path(__file__).parent / "categorias_base.xlsx"
 
 # =============================================================================
-# FUNÇÕES UTILITÁRIAS E ESCOPO GLOBAL DO EXCEL
+# FUNÇÕES UTILITÁRIAS E LEITORES COM CACHE (MOVIDOS PARA O TOPO)
 # =============================================================================
+
+@st.cache_data(show_spinner=False)
+def ler_csv_cached(file_bytes: bytes, nome: str) -> pd.DataFrame:
+    """Lê arquivos CSV aplicando cache em memória do Streamlit."""
+    return pd.read_csv(
+        io.BytesIO(file_bytes), sep=None, engine='python',
+        encoding='latin1', index_col=False
+    )
+
+
+@st.cache_data(show_spinner=False)
+def ler_xlsx_cached(file_bytes: bytes, nome: str) -> pd.DataFrame:
+    """Lê arquivos Excel aplicando cache em memória do Streamlit."""
+    return pd.read_excel(io.BytesIO(file_bytes), dtype=str)
+
 
 def clean(t: str) -> str:
     if pd.isna(t):
@@ -178,16 +193,16 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
     return buf.getvalue()
 
 # =============================================================================
-# PERSISTÊNCIA REAL EM DISCO — SISTEMA DE CATEGORIAS ADAPTATIVO [AJUSTADO]
+# PERSISTÊNCIA REAL EM DISCO — SISTEMA DE CATEGORIAS ADAPTATIVO
 # =============================================================================
 
 def carregar_categorias_do_disco() -> pd.DataFrame:
     """Lê o arquivo do disco mapeando colunas dinamicamente (Código, Material, Categoria/Grupo)."""
     if ARQUIVO_CATEGORIAS.exists():
         try:
+            # CORREÇÃO: Lê o arquivo utilizando a biblioteca nativa do pandas para checagem estrutural inicial
             df = pd.read_excel(ARQUIVO_CATEGORIAS, dtype=str)
             
-            # [AJUSTE DE INTELIGÊNCIA]: Identifica colunas mesmo se chamarem Grupo, Produto ou Código com/sem acento
             c_cod = find_col(df, ['codigo', 'cod', 'ca3', 'id'])
             c_mat = find_col(df, ['material', 'produto', 'insumo', 'descri'])
             c_cat = find_col(df, ['categoria', 'grupo', 'classe', 'tipo'])
@@ -198,13 +213,11 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
                 df_clean["Material"] = df[c_mat].fillna("").astype(str) if c_mat else "PRODUTO SEM COMPLEMENTO"
                 df_clean["Categoria"] = df[c_cat].str.upper().str.strip().fillna("OUTROS")
                 
-                # Garante limpeza e unicidade
                 df_clean = df_clean[df_clean["Código"] != ""].drop_duplicates("Código")
                 return df_clean.reset_index(drop=True)
         except Exception:
             pass
     
-    # Estrutura padrão limpa se o arquivo falhar ou não existir
     df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria"])
     try:
         df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
@@ -373,7 +386,7 @@ st.write("")
 tab1, tab2 = st.tabs(["⚡ Processar Pedido com IA Logística", "🗂️ Gestão de Categorias de Insumos"])
 
 # =============================================================================
-# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS (FILTRO SOB DEMANDA) [AJUSTADO]
+# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS (FILTRO SOB DEMANDA)
 # =============================================================================
 with tab2:
     st.subheader("🗂️ Mapeamento Global de Categorias")
@@ -384,7 +397,7 @@ with tab2:
 
     df_cat_atual = st.session_state["df_categorias"].copy()
 
-    # [AJUSTE DE CORRESPONDÊNCIA DE FILTROS]: O filtro agora lê as categorias reais contidas na planilha
+    # O filtro lê as categorias reais contidas na planilha
     lista_grupos_reais = sorted(list(df_cat_atual["Categoria"].unique())) if not df_cat_atual.empty else CATEGORIAS_PADRAO
     if "OUTROS" not in lista_grupos_reais:
         lista_grupos_reais.append("OUTROS")
@@ -402,7 +415,7 @@ with tab2:
     filtro_termo_cat = fc1.text_input("🔍 Pesquisar Insumo por nome ou código para alteração:", value="", help="Digite algo para revelar a tabela.")
     filtro_sel_cat = fc2.selectbox("Filtrar por Grupo Corespondente:", ["TODOS"] + lista_grupos_reais)
 
-    # [AJUSTE SOLICITADO — GATILHO VISUAL]: A tabela só abre se houver termo digitado ou grupo diferente de "TODOS"
+    # A tabela só abre se houver termo digitado ou grupo diferente de "TODOS"
     alguem_pesquisou = (filtro_termo_cat.strip() != "") or (filtro_sel_cat != "TODOS")
 
     if alguem_pesquisou:
@@ -451,7 +464,6 @@ with tab2:
             st.session_state.pop("df_categorias", None)
             st.rerun()
     else:
-        # Layout limpo quando não há buscas ativas
         st.warning("🔍 Para visualizar, incluir ou editar os registros das categorias, utilize os campos de pesquisa ou escolha um grupo acima.")
 
 # =============================================================================
