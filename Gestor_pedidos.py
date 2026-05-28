@@ -58,12 +58,13 @@ MAPA_STATUS = {
 STATUS_CORES = {k: v[0] for k, v in MAPA_STATUS.items()}
 EXCEL_CORES  = {k: (v[1], v[2]) for k, v in MAPA_STATUS.items()}
 
-CATEGORIAS_DISPONIVEIS = sorted([
+# Lista base de segurança para preenchimento de opções
+CATEGORIAS_PADRAO = sorted([
     "MEDICAMENTO", "MMH", "SORO", "NUTRIÇÃO", "GASES MEDICINAIS",
     "MATERIAL DIAGNÓSTICO", "OUTROS",
 ])
 
-# Caminho do arquivo físico persistente na mesma pasta do app.py
+# Caminho do arquivo físico permanente na mesma pasta do app.py
 ARQUIVO_CATEGORIAS = Path(__file__).parent / "categorias_base.xlsx"
 
 # =============================================================================
@@ -177,21 +178,33 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
     return buf.getvalue()
 
 # =============================================================================
-# PERSISTÊNCIA REAL EM DISCO — SISTEMA DE CATEGORIAS
+# PERSISTÊNCIA REAL EM DISCO — SISTEMA DE CATEGORIAS ADAPTATIVO [AJUSTADO]
 # =============================================================================
 
 def carregar_categorias_do_disco() -> pd.DataFrame:
-    """Lê o arquivo permanente do disco. Se não existir, cria a base limpa."""
+    """Lê o arquivo do disco mapeando colunas dinamicamente (Código, Material, Categoria/Grupo)."""
     if ARQUIVO_CATEGORIAS.exists():
         try:
             df = pd.read_excel(ARQUIVO_CATEGORIAS, dtype=str)
-            df["Código"] = df["Código"].apply(clean_key)
-            df["Categoria"] = df["Categoria"].str.upper().str.strip()
-            return df[df["Código"] != ""].drop_duplicates("Código").reset_index(drop=True)
+            
+            # [AJUSTE DE INTELIGÊNCIA]: Identifica colunas mesmo se chamarem Grupo, Produto ou Código com/sem acento
+            c_cod = find_col(df, ['codigo', 'cod', 'ca3', 'id'])
+            c_mat = find_col(df, ['material', 'produto', 'insumo', 'descri'])
+            c_cat = find_col(df, ['categoria', 'grupo', 'classe', 'tipo'])
+            
+            if c_cod and c_cat:
+                df_clean = pd.DataFrame()
+                df_clean["Código"] = df[c_cod].apply(clean_key)
+                df_clean["Material"] = df[c_mat].fillna("").astype(str) if c_mat else "PRODUTO SEM COMPLEMENTO"
+                df_clean["Categoria"] = df[c_cat].str.upper().str.strip().fillna("OUTROS")
+                
+                # Garante limpeza e unicidade
+                df_clean = df_clean[df_clean["Código"] != ""].drop_duplicates("Código")
+                return df_clean.reset_index(drop=True)
         except Exception:
             pass
     
-    # Estrutura inicial padrão caso o arquivo não exista
+    # Estrutura padrão limpa se o arquivo falhar ou não existir
     df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria"])
     try:
         df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
@@ -321,7 +334,7 @@ def definir_alerta_e_acao(
 
     return "Desabastecimento Crítico", "Sem saldo na central e sem estoque parado em parceiras."
 
-# Inicializa banco de dados local
+# Inicializa banco de dados local unificado
 inicializar_categorias_session()
 
 # =============================================================================
@@ -360,17 +373,21 @@ st.write("")
 tab1, tab2 = st.tabs(["⚡ Processar Pedido com IA Logística", "🗂️ Gestão de Categorias de Insumos"])
 
 # =============================================================================
-# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS (SEM ARQUIVOS PISCANDO)
+# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS (FILTRO SOB DEMANDA) [AJUSTADO]
 # =============================================================================
 with tab2:
     st.subheader("🗂️ Mapeamento Global de Categorias")
     st.info(
         "As alterações feitas nesta tabela são salvas de forma **permanente** no computador. "
-        "Você pode modificar a categoria dos insumos ou incluir novos registros usando os botões da própria tabela. "
-        "No dia seguinte, suas modificações continuarão salvas."
+        "Para evitar lentidão e poluição visual, a tabela permanece oculta e **abre automaticamente assim que você realizar uma pesquisa por nome/código ou escolher um grupo específico** nos filtros abaixo."
     )
 
     df_cat_atual = st.session_state["df_categorias"].copy()
+
+    # [AJUSTE DE CORRESPONDÊNCIA DE FILTROS]: O filtro agora lê as categorias reais contidas na planilha
+    lista_grupos_reais = sorted(list(df_cat_atual["Categoria"].unique())) if not df_cat_atual.empty else CATEGORIAS_PADRAO
+    if "OUTROS" not in lista_grupos_reais:
+        lista_grupos_reais.append("OUTROS")
 
     # Métricas de Controle Gerencial
     mc1, mc2, mc3 = st.columns(3)
@@ -382,51 +399,60 @@ with tab2:
     
     # Filtros de busca rápidos exclusivos da tabela de categorias
     fc1, fc2 = st.columns([3, 1])
-    filtro_termo_cat = fc1.text_input("🔍 Pesquisar Insumo por nome ou código para alteração:", value="")
-    filtro_sel_cat = fc2.selectbox("Filtrar por Grupo:", ["TODOS"] + CATEGORIAS_DISPONIVEIS)
+    filtro_termo_cat = fc1.text_input("🔍 Pesquisar Insumo por nome ou código para alteração:", value="", help="Digite algo para revelar a tabela.")
+    filtro_sel_cat = fc2.selectbox("Filtrar por Grupo Corespondente:", ["TODOS"] + lista_grupos_reais)
 
-    df_filtrado_cat = df_cat_atual.copy()
-    if filtro_termo_cat:
-        df_filtrado_cat = df_filtrado_cat[
-            (df_filtrado_cat["Código"].astype(str).str.contains(filtro_termo_cat, case=False, na=False)) |
-            (df_filtrado_cat["Material"].astype(str).str.contains(filtro_termo_cat, case=False, na=False))
-        ]
-    if filtro_sel_cat != "TODOS":
-        df_filtrado_cat = df_filtrado_cat[df_filtrado_cat["Categoria"] == filtro_sel_cat]
+    # [AJUSTE SOLICITADO — GATILHO VISUAL]: A tabela só abre se houver termo digitado ou grupo diferente de "TODOS"
+    alguem_pesquisou = (filtro_termo_cat.strip() != "") or (filtro_sel_cat != "TODOS")
 
-    # Editor de dados interativo e conectado à memória
-    df_editor_output = st.data_editor(
-        df_filtrado_cat.reset_index(drop=True),
-        use_container_width=True,
-        hide_index=True,
-        num_rows="dynamic",
-        column_config={
-            "Código": st.column_config.TextColumn("Código MV", required=True, width="small"),
-            "Material": st.column_config.TextColumn("Descrição Completa do Insumo", required=True, width="large"),
-            "Categoria": st.column_config.SelectboxColumn("Categoria Logística", options=CATEGORIAS_DISPONIVEIS, required=True, width="medium")
-        },
-        key="editor_categorias"
-    )
+    if alguem_pesquisou:
+        df_filtrado_cat = df_cat_atual.copy()
+        if filtro_termo_cat:
+            df_filtrado_cat = df_filtrado_cat[
+                (df_filtrado_cat["Código"].astype(str).str.contains(filtro_termo_cat, case=False, na=False)) |
+                (df_filtrado_cat["Material"].astype(str).str.contains(filtro_termo_cat, case=False, na=False))
+            ]
+        if filtro_sel_cat != "TODOS":
+            df_filtrado_cat = df_filtrado_cat[df_filtrado_cat["Categoria"] == filtro_sel_cat]
 
-    # Fluxo de Salvamento Seguro (Evita sumiço de dados ao fechar o app)
-    col_btn_salvar, col_btn_reset = st.columns([4, 1])
-    if col_btn_salvar.button("💾 SALVAR ALTERAÇÕES DE FORMA PERMANENTE NO DISCO", use_container_width=True):
-        codigos_visíveis = set(df_filtrado_cat["Código"].astype(str).tolist())
-        df_base_original = st.session_state["df_categorias"].copy()
-        
-        # Remove registros antigos do escopo filtrado e anexa as novas edições feitas
-        df_base_limpo = df_base_original[~df_base_original["Código"].astype(str).isin(codigos_visíveis)]
-        df_novo_consolidado = pd.concat([df_base_limpo, df_editor_output], ignore_index=True).drop_duplicates("Código", keep="last")
-        df_novo_consolidado = df_novo_consolidado[df_novo_consolidado["Código"].astype(str).str.strip() != ""]
-        
-        st.session_state["df_categorias"] = df_novo_consolidado.reset_index(drop=True)
-        if salvar_categorias_no_disco(st.session_state["df_categorias"]):
-            st.success("✅ Sucesso! Todas as alterações foram salvas fisicamente em 'categorias_base.xlsx'.")
+        st.markdown(f"##### 📋 Itens Encontrados ({len(df_filtrado_cat)} registros)")
+
+        # Editor de dados interativo conectado à memória
+        df_editor_output = st.data_editor(
+            df_filtrado_cat.reset_index(drop=True),
+            use_container_width=True,
+            hide_index=True,
+            num_rows="dynamic",
+            column_config={
+                "Código": st.column_config.TextColumn("Código MV", required=True, width="small"),
+                "Material": st.column_config.TextColumn("Descrição Completa do Insumo", required=True, width="large"),
+                "Categoria": st.column_config.SelectboxColumn("Categoria Logística", options=lista_grupos_reais, required=True, width="medium")
+            },
+            key="editor_categorias"
+        )
+
+        # Fluxo de Salvamento Seguro (Evita sumiço de dados ao fechar o app)
+        col_btn_salvar, col_btn_reset = st.columns([4, 1])
+        if col_btn_salvar.button("💾 SALVAR ALTERAÇÕES DE FORMA PERMANENTE NO DISCO", use_container_width=True):
+            codigos_visíveis = set(df_filtrado_cat["Código"].astype(str).tolist())
+            df_base_original = st.session_state["df_categorias"].copy()
+            
+            # Atualiza os dados mesclando as modificações feitas
+            df_base_limpo = df_base_original[~df_base_original["Código"].astype(str).isin(codigos_visíveis)]
+            df_novo_consolidado = pd.concat([df_base_limpo, df_editor_output], ignore_index=True).drop_duplicates("Código", keep="last")
+            df_novo_consolidado = df_novo_consolidado[df_novo_consolidado["Código"].astype(str).str.strip() != ""]
+            
+            st.session_state["df_categorias"] = df_novo_consolidado.reset_index(drop=True)
+            if salvar_categorias_no_disco(st.session_state["df_categorias"]):
+                st.success("✅ Sucesso! Todas as alterações foram salvas fisicamente em 'categorias_base.xlsx'.")
+                st.rerun()
+
+        if col_btn_reset.button("🔄 Cancelar Edições", use_container_width=True):
+            st.session_state.pop("df_categorias", None)
             st.rerun()
-
-    if col_btn_reset.button("🔄 Cancelar Edições", use_container_width=True):
-        st.session_state.pop("df_categorias", None)
-        st.rerun()
+    else:
+        # Layout limpo quando não há buscas ativas
+        st.warning("🔍 Para visualizar, incluir ou editar os registros das categorias, utilize os campos de pesquisa ou escolha um grupo acima.")
 
 # =============================================================================
 # TAB 1 — PROCESSAR PEDIDO DE COMPRAS / SOLICITAÇÃO
@@ -574,7 +600,7 @@ with tab1:
                                 .apply(lambda g: dict(zip(g['almox_limpo'], g['qtd_num'])))
                                 .to_dict()
                             )
-                            for key_med, almox_dict in resume_p_dict.items():
+                            for key_med, almox_dict in resumo_p_dict.items():
                                 if key_med not in consumo_outras_total:
                                     consumo_outras_total[key_med] = {}
                                 for a_id, q_val in almox_dict.items():
@@ -650,12 +676,12 @@ with tab1:
                 df_g1 = df_g1[df_g1['Status'] != 'Sem Consumo'] 
 
                 if not df_g1.empty:
-                    grafico_donut = alt.Chart(df_g1).mark_arc(innerRadius=65, stroke='#fff').encode(
+                    donut_chart = alt.Chart(df_g1).mark_arc(innerRadius=65, stroke='#fff').encode(
                         theta=alt.Theta(field="Quantidade", type="quantitative"),
                         color=alt.Color(field="Status", type="nominal", scale=alt.Scale(domain=list(STATUS_CORES.keys()), range=list(STATUS_CORES.values())), legend=alt.Legend(title="Parecer")),
                         tooltip=['Status', 'Quantidade']
                     ).properties(height=280)
-                    st.altair_chart(grafico_donut, use_container_width=True)
+                    st.altair_chart(donut_chart, use_container_width=True)
                 else:
                     st.info("Sem dados suficientes para gerar a rosca estatística.")
 
@@ -665,13 +691,13 @@ with tab1:
                 df_g2 = df_g2[df_g2['Parecer'] != 'Sem Consumo'].copy()
 
                 if not df_g2.empty:
-                    grafico_stacked = alt.Chart(df_g2).mark_bar().encode(
+                    stacked_chart = alt.Chart(df_g2).mark_bar().encode(
                         x=alt.X('Itens:Q', title="Quantidade de Insumos"),
                         y=alt.Y('Categoria:N', title=None, sort='-x'),
                         color=alt.Color('Parecer:N', scale=alt.Scale(domain=list(STATUS_CORES.keys()), range=list(STATUS_CORES.values())), legend=None),
                         tooltip=['Categoria', 'Parecer', 'Itens']
                     ).properties(height=280)
-                    st.altair_chart(grafico_stacked, use_container_width=True)
+                    st.altair_chart(stacked_chart, use_container_width=True)
                 else:
                     st.info("Nenhuma categoria vinculada ativa no filtro atual.")
 
