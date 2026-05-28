@@ -58,12 +58,7 @@ MAPA_STATUS = {
 STATUS_CORES = {k: v[0] for k, v in MAPA_STATUS.items()}
 EXCEL_CORES  = {k: (v[1], v[2]) for k, v in MAPA_STATUS.items()}
 
-CATEGORIAS_PADRAO = sorted([
-    "MEDICAMENTO", "MMH", "SORO", "NUTRIÇÃO", "GASES MEDICINAIS",
-    "MATERIAL DIAGNÓSTICO", "OUTROS",
-])
-
-# Caminho do arquivo físico permanente na mesma pasta do app.py
+# CORREÇÃO: Força o caminho a buscar exatamente o nome com a primeira letra maiúscula como está no seu GitHub
 ARQUIVO_CATEGORIAS = Path(__file__).parent / "Categorias_base.xlsx"
 
 # =============================================================================
@@ -127,7 +122,6 @@ def validar_colunas(colunas: dict, contexto: str) -> bool:
 
 
 def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") -> bytes:
-    """Gera arquivos Excel com a formatação padrão exigida para todos os relatórios."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as wr:
         df_dados.to_excel(wr, sheet_name=nome_aba, index=False)
@@ -142,20 +136,15 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             ws.write(0, ci, cn, fmt_header)
         ws.set_row(0, 40)
 
-        # Mapeamento inteligente de nomes de colunas possíveis
-        col_mv = find_col(df_dados, ['codigo', 'mv', 'id']) or df_dados.columns[0]
-        col_mat = find_col(df_dados, ['material', 'produto', 'descri']) or df_dados.columns[1]
-        col_cat = find_col(df_dados, ['categoria', 'grupo']) or df_dados.columns[2]
-        col_alerta = find_col(df_dados, ['parecer', 'alerta', 'status'])
-
         LARGURAS = {
-            col_mv: 12, col_mat: 45, col_cat: 16,
+            'Código MV': 12, 'Material': 45, 'Categoria': 16,
             'Saldo Atual Satélite': 20, 'Consumo Médio Diário': 20, 'Estoque Mínimo': 16,
-            'Saldo Almox. Centrais Unificado': 28, 'Ação Logística Sugerida': 50
+            'Necessidade de Ressuprimento': 24, 'Saldo Almox. Centrais Unificado': 28,
+            'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50
         }
         for ci, cn in enumerate(df_dados.columns):
-            larg = LARGURAS.get(cn, 24)
-            fmt_col = fmt_texto if cn in (col_mat, 'Ação Logística Sugerida') else fmt_base
+            larg = LARGURAS.get(cn, 20)
+            fmt_col = fmt_texto if cn in ('Material', 'Ação Logística Sugerida') else fmt_base
             ws.set_column(ci, ci, larg, fmt_col)
 
         total_linhas = len(df_dados)
@@ -163,9 +152,8 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             ws.set_row(ri, 30)
         ws.freeze_panes(1, 0)
 
-        # [CORREÇÃO ABSOLUTA]: Letra calculada de forma 100% dinâmica baseada na coluna ativa detectada
-        if col_alerta:
-            idx_parecer = df_dados.columns.get_loc(col_alerta)
+        if 'Parecer Logístico / Alerta' in df_dados.columns:
+            idx_parecer = df_dados.columns.get_loc('Parecer Logístico / Alerta')
             letra_col = chr(ord('A') + idx_parecer)
             n_cols = len(df_dados.columns) - 1
             
@@ -175,19 +163,22 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
     return buf.getvalue()
 
 # =============================================================================
-# PERSISTÊNCIA EM DISCO COMPATÍVEL COM CLOUD (PLANILHA2)
+# PERSISTÊNCIA EM DISCO CORRIGIDA PARA DUPLAS ABAS (PLANILHA2)
 # =============================================================================
 
 def carregar_categorias_do_disco() -> pd.DataFrame:
     """Lê o arquivo do disco varrendo todas as abas para contornar a Planilha1 vazia."""
     if ARQUIVO_CATEGORIAS.exists():
         try:
+            # Abre o arquivo inspecionando todas as abas internas
             excel_file = pd.ExcelFile(ARQUIVO_CATEGORIAS)
-            abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x or 'plan' in x.lower(), reverse=True)
+            
+            # Percorre as abas (procurando primeiro na Planilha2 que é onde estão os dados)
+            abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x, reverse=True)
             
             for aba in abas_ordenadas:
                 df = excel_file.parse(aba, dtype=str)
-                if df.empty or len(df) < 1: 
+                if df.empty or len(df) < 2: 
                     continue
                 
                 c_cod = find_col(df, ['codigo', 'cod', 'ca3', 'id'])
@@ -206,6 +197,7 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
         except Exception:
             pass
     
+    # Cria estrutura limpa padrão se o arquivo falhar ou não existir
     df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria"])
     try:
         df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
@@ -216,6 +208,7 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
 
 def salvar_categorias_no_disco(df: pd.DataFrame) -> bool:
     try:
+        # Salva na Planilha1 para blindar futuras leituras automáticas simples
         df.to_excel(ARQUIVO_CATEGORIAS, sheet_name="Planilha1", index=False)
         return True
     except Exception as e:
@@ -332,7 +325,7 @@ inicializar_categorias_session()
 # SIDEBAR
 # =============================================================================
 with st.sidebar:
-    st.markdown("### ### 🏥 Unidade & Parâmetros")
+    st.markdown("### 🏥 Unidade & Parâmetros")
     farmacias_opcoes = {
         "Farmácia UMI (Cód. 13)": "13",
         "Farmácia Dutra (Cód. 31)": "31",
