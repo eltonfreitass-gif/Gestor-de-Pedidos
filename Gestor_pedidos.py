@@ -10,7 +10,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 # =============================================================================
-# CONFIGURAÇÃO DA PÁGINA E FONTE ÚNICA GLOBAL DE STATUS/CORES
+# CONFIGURAÇÃO DA PÁGINA E ESTILOS CUSTOMIZADOS
 # =============================================================================
 st.set_page_config(page_title="Gestor HUUFMA PRO", layout="wide", page_icon="🏥")
 
@@ -58,31 +58,20 @@ MAPA_STATUS = {
 STATUS_CORES = {k: v[0] for k, v in MAPA_STATUS.items()}
 EXCEL_CORES  = {k: (v[1], v[2]) for k, v in MAPA_STATUS.items()}
 
-# Lista base de segurança para preenchimento de opções
-CATEGORIAS_PADRAO = sorted([
-    "MEDICAMENTO", "MMH", "SORO", "NUTRIÇÃO", "GASES MEDICINAIS",
-    "MATERIAL DIAGNÓSTICO", "OUTROS",
-])
-
-# Caminho do arquivo físico permanente na mesma pasta do app.py
-ARQUIVO_CATEGORIAS = Path(__file__).parent / "categorias_base.xlsx"
+# CORREÇÃO: Força o caminho a buscar exatamente o nome com a primeira letra maiúscula como está no seu GitHub
+ARQUIVO_CATEGORIAS = Path(__file__).parent / "Categorias_base.xlsx"
 
 # =============================================================================
-# FUNÇÕES UTILITÁRIAS E LEITORES COM CACHE (MOVIDOS PARA O TOPO)
+# FUNÇÕES UTILITÁRIAS E LEITORES COM CACHE
 # =============================================================================
 
 @st.cache_data(show_spinner=False)
 def ler_csv_cached(file_bytes: bytes, nome: str) -> pd.DataFrame:
-    """Lê arquivos CSV aplicando cache em memória do Streamlit."""
-    return pd.read_csv(
-        io.BytesIO(file_bytes), sep=None, engine='python',
-        encoding='latin1', index_col=False
-    )
+    return pd.read_csv(io.BytesIO(file_bytes), sep=None, engine='python', encoding='latin1', index_col=False)
 
 
 @st.cache_data(show_spinner=False)
 def ler_xlsx_cached(file_bytes: bytes, nome: str) -> pd.DataFrame:
-    """Lê arquivos Excel aplicando cache em memória do Streamlit."""
     return pd.read_excel(io.BytesIO(file_bytes), dtype=str)
 
 
@@ -139,18 +128,9 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
         wb = wr.book
         ws = wr.sheets[nome_aba]
 
-        fmt_base = wb.add_format({
-            'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
-            'border': 1, 'border_color': '#D0D0D0', 'font_size': 10
-        })
-        fmt_texto = wb.add_format({
-            'align': 'left', 'valign': 'vcenter', 'text_wrap': True,
-            'border': 1, 'border_color': '#D0D0D0', 'font_size': 10
-        })
-        fmt_header = wb.add_format({
-            'bold': True, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
-            'bg_color': '#1E3A8A', 'font_color': '#FFFFFF', 'border': 1, 'font_size': 11
-        })
+        fmt_base = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+        fmt_texto = wb.add_format({'align': 'left', 'valign': 'vcenter', 'text_wrap': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+        fmt_header = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'bg_color': '#1E3A8A', 'font_color': '#FFFFFF', 'border': 1, 'font_size': 11})
 
         for ci, cn in enumerate(df_dados.columns):
             ws.write(0, ci, cn, fmt_header)
@@ -178,46 +158,46 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             n_cols = len(df_dados.columns) - 1
             
             for status, (bg, fg) in EXCEL_CORES.items():
-                fmt_cond = wb.add_format({
-                    'bg_color': bg, 'font_color': fg, 'align': 'center', 'valign': 'vcenter',
-                    'text_wrap': True, 'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10
-                })
-                ws.conditional_format(
-                    1, 0, total_linhas, n_cols,
-                    {
-                        'type': 'formula',
-                        'criteria': f'=${letra_col}2="{status}"',
-                        'format': fmt_cond,
-                    }
-                )
+                fmt_cond = wb.add_format({'bg_color': bg, 'font_color': fg, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+                ws.conditional_format(1, 0, total_linhas, n_cols, {'type': 'formula', 'criteria': f'=${letra_col}2="{status}"', 'format': fmt_cond})
     return buf.getvalue()
 
 # =============================================================================
-# PERSISTÊNCIA REAL EM DISCO — SISTEMA DE CATEGORIAS ADAPTATIVO
+# PERSISTÊNCIA EM DISCO CORRIGIDA PARA DUPLAS ABAS (PLANILHA2)
 # =============================================================================
 
 def carregar_categorias_do_disco() -> pd.DataFrame:
-    """Lê o arquivo do disco mapeando colunas dinamicamente (Código, Material, Categoria/Grupo)."""
+    """Lê o arquivo do disco varrendo todas as abas para contornar a Planilha1 vazia."""
     if ARQUIVO_CATEGORIAS.exists():
         try:
-            # CORREÇÃO: Lê o arquivo utilizando a biblioteca nativa do pandas para checagem estrutural inicial
-            df = pd.read_excel(ARQUIVO_CATEGORIAS, dtype=str)
+            # Abre o arquivo inspecionando todas as abas internas
+            excel_file = pd.ExcelFile(ARQUIVO_CATEGORIAS)
             
-            c_cod = find_col(df, ['codigo', 'cod', 'ca3', 'id'])
-            c_mat = find_col(df, ['material', 'produto', 'insumo', 'descri'])
-            c_cat = find_col(df, ['categoria', 'grupo', 'classe', 'tipo'])
+            # Percorre as abas (procurando primeiro na Planilha2 que é onde estão os dados)
+            abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x, reverse=True)
             
-            if c_cod and c_cat:
-                df_clean = pd.DataFrame()
-                df_clean["Código"] = df[c_cod].apply(clean_key)
-                df_clean["Material"] = df[c_mat].fillna("").astype(str) if c_mat else "PRODUTO SEM COMPLEMENTO"
-                df_clean["Categoria"] = df[c_cat].str.upper().str.strip().fillna("OUTROS")
+            for aba in abas_ordenadas:
+                df = excel_file.parse(aba, dtype=str)
+                if df.empty or len(df) < 2: 
+                    continue
                 
-                df_clean = df_clean[df_clean["Código"] != ""].drop_duplicates("Código")
-                return df_clean.reset_index(drop=True)
+                c_cod = find_col(df, ['codigo', 'cod', 'ca3', 'id'])
+                c_mat = find_col(df, ['material', 'produto', 'insumo', 'descri', 'nome'])
+                c_cat = find_col(df, ['categoria', 'grupo', 'classe', 'tipo'])
+                
+                if c_cod and c_cat:
+                    df_clean = pd.DataFrame()
+                    df_clean["Código"] = df[c_cod].apply(clean_key)
+                    df_clean["Material"] = df[c_mat].fillna("").astype(str) if c_mat else "PRODUTO SEM DESCRIÇÃO"
+                    df_clean["Categoria"] = df[c_cat].str.upper().str.strip().fillna("OUTROS")
+                    
+                    df_clean = df_clean[df_clean["Código"] != ""].drop_duplicates("Código")
+                    if not df_clean.empty:
+                        return df_clean.reset_index(drop=True)
         except Exception:
             pass
     
+    # Cria estrutura limpa padrão se o arquivo falhar ou não existir
     df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria"])
     try:
         df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
@@ -227,12 +207,12 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
 
 
 def salvar_categorias_no_disco(df: pd.DataFrame) -> bool:
-    """Escreve as alterações fisicamente no arquivo do computador."""
     try:
-        df.to_excel(ARQUIVO_CATEGORIAS, index=False)
+        # Salva na Planilha1 para blindar futuras leituras automáticas simples
+        df.to_excel(ARQUIVO_CATEGORIAS, sheet_name="Planilha1", index=False)
         return True
     except Exception as e:
-        st.error(f"❌ Erro ao salvar categorias_base.xlsx no disco: {e}")
+        st.error(f"❌ Erro ao salvar Categorias_base.xlsx no disco: {e}")
         return False
 
 
@@ -249,7 +229,6 @@ def obter_mapa_categorias() -> dict:
 
 
 def enriquecer_categorias_com_estoque(df_est: pd.DataFrame, c_est_cod: str, c_est_prod: str):
-    """Encontra novos insumos processados e inclui automaticamente na base como 'OUTROS'."""
     df_cat = st.session_state.get("df_categorias", pd.DataFrame()).copy()
     codigos_existentes = set(df_cat["Código"].astype(str).tolist())
 
@@ -291,12 +270,7 @@ def calcular_sugestao(row: pd.Series, dias_pedido: int) -> int:
     return max(0, round(meta_final - est_atual))
 
 
-def definir_alerta_e_acao(
-    row: pd.Series,
-    dict_saldos_centrais: dict,
-    dict_saldos_parceiras: dict,
-    consumo_outras_total: dict,
-) -> tuple:
+def definir_alerta_e_acao(row: pd.Series, dict_saldos_centrais: dict, dict_saldos_parceiras: dict, consumo_outras_total: dict) -> tuple:
     cod = row['Código MV']
     sug = row['Necessidade de Ressuprimento']
     cmd = row['Consumo Médio Diário']
@@ -305,17 +279,14 @@ def definir_alerta_e_acao(
 
     if cmd == 0 and est_minimo <= 0 and est_un == 0:
         return "Sem Consumo", "Avaliar se é necessário inativar o item na farmácia."
-
     if cmd > 0 and est_un > (cmd * 60):
         return "Estoque Excessivo", "Estoque cobre mais de 60 dias. Avaliar devolução."
-
     if cmd == 0 and est_un > 0:
         if est_un <= est_minimo:
             return "Estoque Parado", "Item sem consumo, mas dentro do estoque mínimo parametrizado."
         else:
             excedente = int(est_un - est_minimo)
             return "Estoque Parado", f"{excedente} unidades acima do estoque mínimo. Considerar devolução ou remanejamento."
-
     if sug <= 0:
         if est_un < est_minimo:
             return "Estoque em Alerta", "Estoque abaixo do mínimo de segurança. Monitorar giro."
@@ -386,7 +357,7 @@ st.write("")
 tab1, tab2 = st.tabs(["⚡ Processar Pedido com IA Logística", "🗂️ Gestão de Categorias de Insumos"])
 
 # =============================================================================
-# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS (FILTRO SOB DEMANDA)
+# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS (FILTRO SOB DEMANDA AUTOMÁTICO)
 # =============================================================================
 with tab2:
     st.subheader("🗂️ Mapeamento Global de Categorias")
@@ -397,7 +368,7 @@ with tab2:
 
     df_cat_atual = st.session_state["df_categorias"].copy()
 
-    # O filtro lê as categorias reais contidas na planilha
+    # O filtro lê as categorias reais dinâmicas contidas na sua planilha do GitHub (OPME, Dieta, etc.)
     lista_grupos_reais = sorted(list(df_cat_atual["Categoria"].unique())) if not df_cat_atual.empty else CATEGORIAS_PADRAO
     if "OUTROS" not in lista_grupos_reais:
         lista_grupos_reais.append("OUTROS")
@@ -413,7 +384,7 @@ with tab2:
     # Filtros de busca rápidos exclusivos da tabela de categorias
     fc1, fc2 = st.columns([3, 1])
     filtro_termo_cat = fc1.text_input("🔍 Pesquisar Insumo por nome ou código para alteração:", value="", help="Digite algo para revelar a tabela.")
-    filtro_sel_cat = fc2.selectbox("Filtrar por Grupo Corespondente:", ["TODOS"] + lista_grupos_reais)
+    filtro_sel_cat = fc2.selectbox("Filtrar por Grupo Correspondente:", ["TODOS"] + lista_grupos_reais)
 
     # A tabela só abre se houver termo digitado ou grupo diferente de "TODOS"
     alguem_pesquisou = (filtro_termo_cat.strip() != "") or (filtro_sel_cat != "TODOS")
@@ -450,14 +421,13 @@ with tab2:
             codigos_visíveis = set(df_filtrado_cat["Código"].astype(str).tolist())
             df_base_original = st.session_state["df_categorias"].copy()
             
-            # Atualiza os dados mesclando as modificações feitas
             df_base_limpo = df_base_original[~df_base_original["Código"].astype(str).isin(codigos_visíveis)]
             df_novo_consolidado = pd.concat([df_base_limpo, df_editor_output], ignore_index=True).drop_duplicates("Código", keep="last")
             df_novo_consolidado = df_novo_consolidado[df_novo_consolidado["Código"].astype(str).str.strip() != ""]
             
             st.session_state["df_categorias"] = df_novo_consolidado.reset_index(drop=True)
             if salvar_categorias_no_disco(st.session_state["df_categorias"]):
-                st.success("✅ Sucesso! Todas as alterações foram salvas fisicamente em 'categorias_base.xlsx'.")
+                st.success("✅ Sucesso! Todas as alterações foram salvas fisicamente em 'Categorias_base.xlsx'.")
                 st.rerun()
 
         if col_btn_reset.button("🔄 Cancelar Edições", use_container_width=True):
