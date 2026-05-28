@@ -16,9 +16,12 @@ st.set_page_config(page_title="Gestor HUUFMA PRO", layout="wide", page_icon="�
 
 st.markdown("""
     <style>
+    /* Ajustes Gerais de Layout */
     .main .block-container { padding-top: 2rem; }
     h1 { color: #1E3A8A; font-weight: 700; margin-bottom: 0.5rem; }
     h2, h3 { color: #2C3E50; font-weight: 600; }
+    
+    /* Quadrantes de Métricas Premium */
     div[data-testid="stMetric"] {
         background-color: #FFFFFF;
         border: 1px solid #E2E8F0;
@@ -26,6 +29,8 @@ st.markdown("""
         border-radius: 0.75rem;
         box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05), 0 2px 4px -1px rgba(0,0,0,0.03);
     }
+    
+    /* Botão Principal de Processamento */
     div.stButton > button:first-child {
         background-color: #10B981 !important;
         color: white !important;
@@ -39,14 +44,43 @@ st.markdown("""
         background-color: #059669 !important;
         transform: translateY(-1px);
     }
+
+    /* Customização dos componentes de Upload */
+    div[data-testid="stFileUploaderFileData"] {
+        padding: 4px 8px !important;
+        margin-top: 4px !important;
+        background-color: #F8FAFC !important;
+        border-radius: 6px !important;
+        border: 1px dashed #E2E8F0 !important;
+    }
+    div[data-testid="stFileUploaderFileName"] {
+        font-size: 0.85rem !important;
+        color: #334155 !important;
+        font-weight: 500 !important;
+    }
+    div[data-testid="stFileUploaderFileData"] section {
+        gap: 6px !important;
+    }
+    div[data-testid="stFileUploaderDropzone"] {
+        padding: 1rem !important;
+        border-radius: 8px !important;
+    }
     </style>
 """, unsafe_allow_html=True)
+
+# Mapeamento Global de Nomes Práticos das Unidades do Hospital
+DIC_NOMES_FARMACIAS = {
+    "7":  "Farmácia Centro Cirúrgico",
+    "13": "Farmácia UMI",
+    "31": "Farmácia Dutra",
+    "34": "Farmácia UTI",
+    "39": "Farmácia Oftalmologia",
+}
 
 # Fonte única global de dados para status e cores (Interface, Fundo Excel, Fonte Excel)
 MAPA_STATUS = {
     "Estoque Suficiente":       ("#A2E8A2", "#E2EFDA", "#375623"),
     "Solicitar":                ("#A6C8FF", "#DDEBF7", "#1F4E78"),
-    "Estoque Crítico CAF":      ("#FFC499", "#FCE4D6", "#C65911"),
     "Remanejar":                ("#FFEAA6", "#FFF2CC", "#7F6000"),
     "Desabastecimento Crítico": ("#FFA6A6", "#F8CBAD", "#C00000"),
     "Estoque Excessivo":        ("#B2EBF2", "#E5F1F4", "#006666"),
@@ -58,7 +92,12 @@ MAPA_STATUS = {
 STATUS_CORES = {k: v[0] for k, v in MAPA_STATUS.items()}
 EXCEL_CORES  = {k: (v[1], v[2]) for k, v in MAPA_STATUS.items()}
 
-# CORREÇÃO: Força o caminho a buscar exatamente o nome com a primeira letra maiúscula como está no seu GitHub
+CATEGORIAS_PADRAO = sorted([
+    "MEDICAMENTO", "MMH", "SORO", "NUTRIÇÃO", "GASES MEDICINAIS",
+    "MATERIAL DIAGNÓSTICO", "OUTROS",
+])
+
+# Caminho do arquivo físico permanente na mesma pasta do app.py
 ARQUIVO_CATEGORIAS = Path(__file__).parent / "Categorias_base.xlsx"
 
 # =============================================================================
@@ -136,15 +175,19 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             ws.write(0, ci, cn, fmt_header)
         ws.set_row(0, 40)
 
+        col_mv = find_col(df_dados, ['codigo', 'mv', 'id']) or df_dados.columns[0]
+        col_mat = find_col(df_dados, ['material', 'produto', 'descri']) or df_dados.columns[1]
+        col_cat = find_col(df_dados, ['categoria', 'grupo']) or df_dados.columns[2]
+        col_alerta = find_col(df_dados, ['parecer', 'alerta', 'status'])
+
         LARGURAS = {
-            'Código MV': 12, 'Material': 45, 'Categoria': 16,
+            col_mv: 12, col_mat: 45, col_cat: 16,
             'Saldo Atual Satélite': 20, 'Consumo Médio Diário': 20, 'Estoque Mínimo': 16,
-            'Necessidade de Ressuprimento': 24, 'Saldo Almox. Centrais Unificado': 28,
-            'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50
+            'Saldo Almox. Centrais Unificado': 28, 'Ação Logística Sugerida': 50
         }
         for ci, cn in enumerate(df_dados.columns):
-            larg = LARGURAS.get(cn, 20)
-            fmt_col = fmt_texto if cn in ('Material', 'Ação Logística Sugerida') else fmt_base
+            larg = LARGURAS.get(cn, 24)
+            fmt_col = fmt_texto if cn in (col_mat, 'Ação Logística Sugerida') else fmt_base
             ws.set_column(ci, ci, larg, fmt_col)
 
         total_linhas = len(df_dados)
@@ -152,8 +195,8 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             ws.set_row(ri, 30)
         ws.freeze_panes(1, 0)
 
-        if 'Parecer Logístico / Alerta' in df_dados.columns:
-            idx_parecer = df_dados.columns.get_loc('Parecer Logístico / Alerta')
+        if col_alerta:
+            idx_parecer = df_dados.columns.get_loc(col_alerta)
             letra_col = chr(ord('A') + idx_parecer)
             n_cols = len(df_dados.columns) - 1
             
@@ -163,22 +206,18 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
     return buf.getvalue()
 
 # =============================================================================
-# PERSISTÊNCIA EM DISCO CORRIGIDA PARA DUPLAS ABAS (PLANILHA2)
+# PERSISTÊNCIA EM DISCO COMPATÍVEL COM CLOUD (PLANILHA2)
 # =============================================================================
 
 def carregar_categorias_do_disco() -> pd.DataFrame:
-    """Lê o arquivo do disco varrendo todas as abas para contornar a Planilha1 vazia."""
     if ARQUIVO_CATEGORIAS.exists():
         try:
-            # Abre o arquivo inspecionando todas as abas internas
             excel_file = pd.ExcelFile(ARQUIVO_CATEGORIAS)
-            
-            # Percorre as abas (procurando primeiro na Planilha2 que é onde estão os dados)
-            abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x, reverse=True)
+            abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x or 'plan' in x.lower(), reverse=True)
             
             for aba in abas_ordenadas:
                 df = excel_file.parse(aba, dtype=str)
-                if df.empty or len(df) < 2: 
+                if df.empty or len(df) < 1: 
                     continue
                 
                 c_cod = find_col(df, ['codigo', 'cod', 'ca3', 'id'])
@@ -188,7 +227,7 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
                 if c_cod and c_cat:
                     df_clean = pd.DataFrame()
                     df_clean["Código"] = df[c_cod].apply(clean_key)
-                    df_clean["Material"] = df[c_mat].fillna("").astype(str) if c_mat else "PRODUTO SEM DESCRIÇÃO"
+                    df_clean["Material"] = df[c_mat].fillna("").astype(str).str.strip() if c_mat else ""
                     df_clean["Categoria"] = df[c_cat].str.upper().str.strip().fillna("OUTROS")
                     
                     df_clean = df_clean[df_clean["Código"] != ""].drop_duplicates("Código")
@@ -197,7 +236,6 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
         except Exception:
             pass
     
-    # Cria estrutura limpa padrão se o arquivo falhar ou não existir
     df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria"])
     try:
         df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
@@ -208,7 +246,6 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
 
 def salvar_categorias_no_disco(df: pd.DataFrame) -> bool:
     try:
-        # Salva na Planilha1 para blindar futuras leituras automáticas simples
         df.to_excel(ARQUIVO_CATEGORIAS, sheet_name="Planilha1", index=False)
         return True
     except Exception as e:
@@ -228,26 +265,39 @@ def obter_mapa_categorias() -> dict:
     return dict(zip(df["Código"].astype(str), df["Categoria"].astype(str)))
 
 
-def enriquecer_categorias_com_estoque(df_est: pd.DataFrame, c_est_cod: str, c_est_prod: str):
+def enriquecer_e_auto_preencher_categorias(df_est: pd.DataFrame, c_est_cod: str, c_est_prod: str):
     df_cat = st.session_state.get("df_categorias", pd.DataFrame()).copy()
-    codigos_existentes = set(df_cat["Código"].astype(str).tolist())
+    
+    df_est_unicos = df_est.drop_duplicates(subset=["key"]).copy()
+    mapa_descricoes_reais = dict(zip(df_est_unicos["key"].astype(str), df_est_unicos[c_est_prod].fillna("").astype(str).str.strip()))
+    
+    def reparar_descricao(row):
+        cod_str = str(row["Código"])
+        desc_atual = str(row["Material"]).strip()
+        if desc_atual == "" or desc_atual.upper() == "PRODUTO SEM DESCRIÇÃO":
+            return mapa_descricoes_reais.get(cod_str, desc_atual)
+        return desc_atual
 
-    df_unicos = df_est.drop_duplicates(subset=["key"]).copy()
-    df_unicos["_ks"] = df_unicos["key"].astype(str)
-    df_novos_raw = df_unicos[~df_unicos["_ks"].isin(codigos_existentes)]
+    if not df_cat.empty:
+        df_cat["Material"] = df_cat.apply(reparar_descricao, axis=1)
+
+    codigos_existentes = set(df_cat["Código"].astype(str).tolist())
+    df_novos_raw = df_est_unicos[~df_est_unicos["key"].astype(str).isin(codigos_existentes)]
 
     if not df_novos_raw.empty:
         df_novos = pd.DataFrame({
-            "Código":    df_novos_raw["_ks"].values,
-            "Material":  df_novos_raw[c_est_prod].fillna("").astype(str).values,
+            "Código":    df_novos_raw["key"].astype(str).values,
+            "Material":  df_novos_raw[c_est_prod].fillna("").astype(str).str.strip().values,
             "Categoria": "OUTROS"
         })
-        df_cat = pd.concat([df_cat, df_novos], ignore_index=True).drop_duplicates("Código")
-        st.session_state["df_categorias"] = df_cat.reset_index(drop=True)
-        salvar_categorias_no_disco(st.session_state["df_categorias"])
+        df_cat = pd.concat([df_cat, df_novos], ignore_index=True)
+    
+    df_cat = df_cat.drop_duplicates("Código", keep="first").reset_index(drop=True)
+    st.session_state["df_categorias"] = df_cat
+    salvar_categorias_no_disco(df_cat)
 
 # =============================================================================
-# LÓGICA DE NEGÓCIO
+# LÓGICA DE NEGÓCIO E REGRAS ATUALIZADAS
 # =============================================================================
 
 def calcular_cmd(qtd_total: float, dias: int) -> float:
@@ -280,16 +330,18 @@ def definir_alerta_e_acao(row: pd.Series, dict_saldos_centrais: dict, dict_saldo
     if cmd == 0 and est_minimo <= 0 and est_un == 0:
         return "Sem Consumo", "Avaliar se é necessário inativar o item na farmácia."
     if cmd > 0 and est_un > (cmd * 60):
-        return "Estoque Excessivo", "Estoque cobre mais de 60 dias. Avaliar devolução."
+        return "Estoque Excessivo", "Estoque acima da necessidade de 60 dias. Devolver!."
     if cmd == 0 and est_un > 0:
         if est_un <= est_minimo:
             return "Estoque Parado", "Item sem consumo, mas dentro do estoque mínimo parametrizado."
         else:
             excedente = int(est_un - est_minimo)
-            return "Estoque Parado", f"{excedente} unidades acima do estoque mínimo. Considerar devolução ou remanejamento."
+            return "Estoque Parado", f"{excedente} unidades acima do estoque mínimo. Considerar devolver ou remanejar para outra farmácia."
+            
+    if sug > 0 and est_un < est_minimo:
+        return "Estoque em Alerta", "Estoque abaixo do mínimo de segurança. Abastecer urgentemente!."
+        
     if sug <= 0:
-        if est_un < est_minimo:
-            return "Estoque em Alerta", "Estoque abaixo do mínimo de segurança. Monitorar giro."
         return "Estoque Suficiente", "Estoque dentro da cobertura ideal."
 
     saldos_nas_centrais = dict_saldos_centrais.get(cod, {})
@@ -300,7 +352,7 @@ def definir_alerta_e_acao(row: pd.Series, dict_saldos_centrais: dict, dict_saldo
         if saldo_total_central >= sug:
             return "Solicitar", f"Solicitar {int(sug)} un. ao Almoxarifado Central {central_principal}."
         else:
-            return "Estoque Crítico CAF", f"Pegar {int(saldo_total_central)} un. no Almox Central {central_principal} e remanejar o restante."
+            return f"Estoque Crítico no Almoxarifado {central_principal}", f"Pegar {int(saldo_total_central)} un. no Almox Central {central_principal} e remanejar o restante."
 
     saldos_parceiras = dict_saldos_parceiras.get(cod, {})
     consumos_parceiras = consumo_outras_total.get(cod, {})
@@ -310,22 +362,23 @@ def definir_alerta_e_acao(row: pd.Series, dict_saldos_centrais: dict, dict_saldo
         if saldo_f > 0:
             c_parc = consumos_parceiras.get(farm_id, 0)
             if c_parc == 0 or saldo_f > (c_parc * 3):
-                farmacias_com_estoque_parado.append(f"Cód {farm_id} ({int(saldo_f)} un.)")
+                nome_pratico = DIC_NOMES_FARMACIAS.get(str(farm_id), "Farmácia Satélite")
+                farmacias_com_estoque_parado.append(f"Cód {farm_id} ({nome_pratico} - {int(saldo_f)} un.)")
 
     if farmacias_com_estoque_parado:
-        locais = ", ".join(farmacias_com_estoque_parado)
+        locais = " | ".join(farmacias_com_estoque_parado)
         return "Remanejar", f"Central Zerada! Transferir de: {locais}."
 
-    return "Desabastecimento Crítico", "Sem saldo na central e sem estoque parado em parceiras."
+    return "Desabastecimento Crítico", "Sem saldo nos almoxarifados e sem estoque parado nas farmácias."
 
 # Inicializa banco de dados local unificado
 inicializar_categorias_session()
 
 # =============================================================================
-# SIDEBAR
+# SIDEBAR COM MANUAL E CRÉDITOS EXCLUSIVOS
 # =============================================================================
 with st.sidebar:
-    st.markdown("### 🏥 Unidade & Parâmetros")
+    st.markdown("### 🏥 Parâmetros")
     farmacias_opcoes = {
         "Farmácia UMI (Cód. 13)": "13",
         "Farmácia Dutra (Cód. 31)": "31",
@@ -340,14 +393,62 @@ with st.sidebar:
     st.markdown("### ⚙️ Parâmetros do Pedido")
     dias_pedido = st.number_input("Defina quantos dias de ressuprimento será solicitado:", value=15, min_value=1)
 
-    hoje = datetime.now()
-    data_inicio = st.date_input("Início do Histórico de Consumo:", value=hoje - timedelta(days=5))
-    data_fim = st.date_input("Fim do Período de Consumo:", value=hoje)
+    ontem = datetime.now() - timedelta(days=1)
+    data_inicio = st.date_input("Início do Histórico de Consumo:", value=ontem - timedelta(days=7), format="DD/MM/YYYY")
+    data_fim = st.date_input("Fim do Período de Consumo:", value=ontem, format="DD/MM/YYYY")
+
+    st.write("---")
+    with st.expander("📄 Manual de Regras Logísticas", expanded=False):
+        st.markdown("""
+        ### Matriz de Alertas e Ações Sugeridas
+        
+        #### 1. ⚪ Sem Consumo
+        * **Condição:** Consumo Médio Diário ($CMD$) = 0, Estoque Mínimo = 0 e Saldo Satélite = 0.
+        * **Ação Logística:** *\"Avaliar se é necessário inativar o item na farmácia.\"*
+        
+        #### 2. 🔵 Estoque Excessivo
+        * **Condição:** Item ativo ($CMD > 0$) com saldo cobrindo mais de 60 dias de consumo.
+        * **Ação Logística:** *\"Estoque acima da necessidade de 60 dias. Devolver!.\"*
+        
+        #### 3. ⚫ Estoque Parado
+        * **Condição:** Giro zerado ($CMD = 0$), mas possui saldo físico na farmácia satélite.
+        * **Ação Logística:** Avisa o volume em excesso acima do estoque mínimo e sugere remanejamento externo.
+        
+        #### 4. 🟡 Estoque em Alerta
+        * **Condição:** A farmácia precisa de material ($Sugestão > 0$), mas o seu saldo atual já caiu abaixo do estoque mínimo de segurança parametrizado.
+        * **Ação Logística:** *\"Estoque abaixo do mínimo de segurança. Abastecer urgentemente!.\"*
+        
+        #### 5. 🟢 Estoque Suficiente
+        * **Condição:** O saldo cobre a janela histórica e está acima da margem de segurança.
+        
+        #### 6. 🔵 Solicitar Abastecimento Central
+        * **Condição:** Pedido $> 0$ e o estoque das **Centrais Unificadas (1, 6, 9, 41, 43)** atende a demanda.
+        * **Ação Logística:** Aponta a central ideal detentora do maior saldo para separação.
+        
+        #### 7. 🟠 Estoque Crítico no Almoxarifado X
+        * **Condição:** Pedido $> 0$, mas a central específica de número X possui saldo parcial e insuficiente.
+        * **Ação Logística:** Orienta raspar a central X e capturar o saldo restante via remanejamento.
+        
+        #### 8. 🟡 Remanejar entre Farmácias
+        * **Condição:** Centrais zeradas, mas existem outras farmácias satélites com saldo parado ou excedente.
+        * **Ação Logística:** Traduz o ID e aponta o nome do setor (ex: *Farmácia UMI*).
+        
+        #### 9. 🔴 Desabastecimento Crítico
+        * **Condição:** Sem saldo nos almoxarifados e sem estoque parado nas farmácias. Ruptura total.
+        """)
+
+    with st.expander("🎖️ Créditos do Sistema", expanded=False):
+        st.markdown("""
+        **Idealização e Desenvolvimento:**
+        * Elton Jonh Freitas Santos
+        * Farmacêutico - Chefe da UDIS/HUUFMA
+        *HUUFMA — Gestão e Inteligência Logística Avançada © 2026*
+        """)
 
 # =============================================================================
 # INTERFACE WEB PRINCIPAL
 # =============================================================================
-st.title("🏥 Gestor de Pedidos Logístico Avançado")
+st.title("🏥 Gestor do Estoque - Unidade de Dispensação Farmacêutica")
 st.markdown(
     f"**Farmácia Ativa:** `{farmacia_selecionada}` | "
     f"**Janela Histórica:** `{data_inicio.strftime('%d/%m/%Y')}` até `{data_fim.strftime('%d/%m/%Y')}`"
@@ -357,7 +458,7 @@ st.write("")
 tab1, tab2 = st.tabs(["⚡ Processar Pedido com IA Logística", "🗂️ Gestão de Categorias de Insumos"])
 
 # =============================================================================
-# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS (FILTRO SOB DEMANDA AUTOMÁTICO)
+# TAB 2 — GERENCIADOR INTEGRADO DE CATEGORIAS
 # =============================================================================
 with tab2:
     st.subheader("🗂️ Mapeamento Global de Categorias")
@@ -368,12 +469,10 @@ with tab2:
 
     df_cat_atual = st.session_state["df_categorias"].copy()
 
-    # O filtro lê as categorias reais dinâmicas contidas na sua planilha do GitHub (OPME, Dieta, etc.)
     lista_grupos_reais = sorted(list(df_cat_atual["Categoria"].unique())) if not df_cat_atual.empty else CATEGORIAS_PADRAO
     if "OUTROS" not in lista_grupos_reais:
         lista_grupos_reais.append("OUTROS")
 
-    # Métricas de Controle Gerencial
     mc1, mc2, mc3 = st.columns(3)
     mc1.metric("📦 Total de Insumos Cadastrados", len(df_cat_atual))
     mc2.metric("🏷️ Categorias Mapeadas", df_cat_atual["Categoria"].nunique() if not df_cat_atual.empty else 0)
@@ -381,12 +480,10 @@ with tab2:
 
     st.write("---")
     
-    # Filtros de busca rápidos exclusivos da tabela de categorias
     fc1, fc2 = st.columns([3, 1])
-    filtro_termo_cat = fc1.text_input("🔍 Pesquisar Insumo por nome ou código para alteração:", value="", help="Digite algo para revelar a tabela.")
+    filtro_termo_cat = fc1.text_input("🔍 Pesquisar Insumo por nome ou código para alteração:", value="")
     filtro_sel_cat = fc2.selectbox("Filtrar por Grupo Correspondente:", ["TODOS"] + lista_grupos_reais)
 
-    # A tabela só abre se houver termo digitado ou grupo diferente de "TODOS"
     alguem_pesquisou = (filtro_termo_cat.strip() != "") or (filtro_sel_cat != "TODOS")
 
     if alguem_pesquisou:
@@ -401,7 +498,6 @@ with tab2:
 
         st.markdown(f"##### 📋 Itens Encontrados ({len(df_filtrado_cat)} registros)")
 
-        # Editor de dados interativo conectado à memória
         df_editor_output = st.data_editor(
             df_filtrado_cat.reset_index(drop=True),
             use_container_width=True,
@@ -415,7 +511,6 @@ with tab2:
             key="editor_categorias"
         )
 
-        # Fluxo de Salvamento Seguro (Evita sumiço de dados ao fechar o app)
         col_btn_salvar, col_btn_reset = st.columns([4, 1])
         if col_btn_salvar.button("💾 SALVAR ALTERAÇÕES DE FORMA PERMANENTE NO DISCO", use_container_width=True):
             codigos_visíveis = set(df_filtrado_cat["Código"].astype(str).tolist())
@@ -441,19 +536,19 @@ with tab2:
 # =============================================================================
 with tab1:
     with st.container(border=True):
-        st.markdown("##### 📥 Upload das Fontes de Dados Obrigatórias")
+        st.markdown("##### 📥 Upload das Fontes de Dados Obrigatórias (AGHU)")
         col1, col2 = st.columns(2)
         file_mov_alvo = col1.file_uploader("1. Movimento da Farmácia Alvo (.csv)", type=["csv"])
         file_est_geral = col2.file_uploader("2. Estoque Geral de todos os Almoxarifados (.csv)", type=["csv"])
         st.write("")
         files_mov_parceiras = st.file_uploader(
-            "3. Movimentos das Outras Farmácias (Opcional - Múltiplos .csv)", type=["csv"], accept_multiple_files=True
+            "3. Movimentos das outras Farmácias, ativa a INTELIGÊNCIA LOGÍSTICA (Múltiplos .csv)", type=["csv"], accept_multiple_files=True
         )
 
     st.write("")
 
     if file_mov_alvo and file_est_geral:
-        if st.button("🚀 GERAR PEDIDO COM INTELIGÊNCIA LOGÍSTICA", use_container_width=True):
+        if st.button("🚀 ANALISAR OS DADOS COM INTELIGÊNCIA LOGÍSTICA", use_container_width=True):
             st.session_state['disparar_processamento_huufma'] = True
 
         if st.session_state.get('disparar_processamento_huufma', False):
@@ -516,7 +611,7 @@ with tab1:
                 if not est_centrais_filtrado.empty:
                     dict_saldos_centrais = (
                         est_centrais_filtrado.groupby('key')
-                        .apply(lambda g: dict(zip(g['almox_limpo'], g['saldo_num'])))
+                        .apply(lambda g: dict(zip(g['almox_limpo'], g['saldo_num'])), include_groups=False)
                         .to_dict()
                     )
 
@@ -527,11 +622,11 @@ with tab1:
                 if not est_outras.empty:
                     dict_saldos_parceiras = (
                         est_outras.groupby('key')
-                        .apply(lambda g: dict(zip(g['almox_limpo'], g['saldo_num'])))
+                        .apply(lambda g: dict(zip(g['almox_limpo'], g['saldo_num'])), include_groups=False)
                         .to_dict()
                     )
 
-                progress.progress(40, text="📊 Calculando consumo...")
+                progress.progress(40, text="📊 Calculando consumo e auditando calendário...")
 
                 mov = mov.copy()
                 mov['dt_formatada'] = pd.to_datetime(mov[c_mov_data], dayfirst=True, errors='coerce')
@@ -540,6 +635,12 @@ with tab1:
                     (mov['dt_formatada'].dt.date <= data_fim) &
                     (mov[c_mov_tipo].astype(str).str.upper() == 'RM')
                 ].copy()
+
+                # Auditoria de calendário preventivo para detectar dias zerados
+                dias_ideais = pd.date_range(start=data_inicio, end=data_fim).date
+                dias_com_movimento = mov_filtrado['dt_formatada'].dt.date.dropna().unique()
+                dias_vazios = [d for d in dias_ideais if d not in dias_com_movimento]
+                st.session_state['datas_sem_movimento_huufma'] = [d.strftime('%d/%m/%Y') for d in dias_vazios]
 
                 dias_considerados = max((data_fim - data_inicio).days + 1, 1)
 
@@ -550,7 +651,7 @@ with tab1:
                 
                 consumo['cmd'] = consumo['total_consumo'].apply(lambda x: calcular_cmd(x, dias_considerados))
 
-                progress.progress(55, text="🔄 Cruzando dados entre parceiras...")
+                progress.progress(55, text="🔄 Cruzando dados entre farmácias...")
 
                 consumo_outras_total = {}
                 if files_mov_parceiras:
@@ -579,7 +680,7 @@ with tab1:
 
                             resumo_p_dict = (
                                 df_p_filt.groupby('key')
-                                .apply(lambda g: dict(zip(g['almox_limpo'], g['qtd_num'])))
+                                .apply(lambda g: dict(zip(g['almox_limpo'], g['qtd_num'])), include_groups=False)
                                 .to_dict()
                             )
                             for key_med, almox_dict in resumo_p_dict.items():
@@ -603,10 +704,14 @@ with tab1:
                 final['Estoque Mínimo'] = final['Código MV'].map(est_min_alvo).fillna(0)
                 final['Necessidade de Ressuprimento'] = final.apply(lambda row: calcular_sugestao(row, dias_pedido), axis=1)
 
-                enriquecer_categorias_com_estoque(est_geral, c_est_cod, c_est_prod)
+                enriquecer_e_auto_preencher_categorias(est_geral, c_est_cod, c_est_prod)
 
                 mapa_cat = obter_mapa_categorias()
                 final['Categoria'] = final['Código MV'].map(mapa_cat).fillna('OUTROS')
+                
+                mapa_descricoes_reparadas = dict(zip(st.session_state["df_categorias"]["Código"].astype(str), st.session_state["df_categorias"]["Material"].astype(str)))
+                final['Material'] = final['Código MV'].map(mapa_descricoes_reparadas).fillna(final['Material'])
+
                 final['Saldo Almox. Centrais Unificado'] = final['Código MV'].apply(lambda c: sum(dict_saldos_centrais.get(c, {}).values()))
 
                 alertas_acoes = final.apply(lambda row: definir_alerta_e_acao(row, dict_saldos_centrais, dict_saldos_parceiras, consumo_outras_total), axis=1)
@@ -625,10 +730,19 @@ with tab1:
         if 'df_final_huufma' in st.session_state:
             df_view = st.session_state['df_final_huufma'].copy()
 
+            datas_vazias_detectadas = st.session_state.get('datas_sem_movimento_huufma', [])
+            if datas_vazias_detectadas:
+                st.warning(
+                    f"⚠️ **Atenção Logística (Auditoria de Calendário):** Não foi encontrada nenhuma movimentação "
+                    f"no arquivo de saídas para as seguintes datas do período selecionado: `{', '.join(datas_vazias_detectadas)}`. "
+                    f"Verifique se o arquivo enviado está completo para evitar subdimensionar a meta do pedido."
+                )
+
             st.write("---")
             df_desabast = df_view[df_view['Parecer Logístico / Alerta'] == "Desabastecimento Crítico"].sort_values('Material')
             df_remanej = df_view[df_view['Parecer Logístico / Alerta'] == "Remanejar"].sort_values('Material')
-            df_caf_disp = df_view[df_view['Parecer Logístico / Alerta'].isin(["Solicitar", "Estoque Crítico CAF"])].sort_values('Material')
+            
+            df_caf_disp = df_view[df_view['Parecer Logístico / Alerta'].str.contains("Solicitar|Almoxarifado", na=False)].sort_values('Material')
             
             df_excesso = df_view[
                 (df_view['Parecer Logístico / Alerta'].isin(["Estoque Excessivo", "Estoque Parado", "Sem Consumo", "Estoque em Alerta"])) &
@@ -646,7 +760,7 @@ with tab1:
                 st.metric("📦 Disponível no Almoxarifado", f"{len(df_caf_disp)} itens")
                 st.download_button("📥 Extrair Lista", data=exportar_excel_padronizado(df_caf_disp, "Disponiveis_CAF"), file_name=f"Disponiveis_Centrais_{cod_farmacia_alvo}.xlsx", key="ex_c3", use_container_width=True)
             with c4:
-                st.metric("⚠️ Overstock (Excesso / Sem Giro)", f"{len(df_excesso)} itens")
+                st.metric("⚠️Atenção! (Excesso/Crítico/Sem Giro)", f"{len(df_excesso)} itens")
                 st.download_button("📥 Extrair Lista", data=exportar_excel_padronizado(df_excesso, "Riscos_Excesso"), file_name=f"Overstock_{cod_farmacia_alvo}.xlsx", key="ex_c4", use_container_width=True)
 
             st.write("")
@@ -654,13 +768,18 @@ with tab1:
 
             with g1:
                 st.markdown("**Saúde Geral do Estoque (% Proporcional)**")
-                df_g1 = df_view.groupby('Parecer Logístico / Alerta')['Código MV'].count().reset_index().rename(columns={'Código MV': 'Quantidade', 'Parecer Logístico / Alerta': 'Status'})
-                df_g1 = df_g1[df_g1['Status'] != 'Sem Consumo'] 
+                df_g1 = df_view.copy()
+                df_g1.loc[df_g1['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False), 'Parecer Logístico / Alerta'] = "Estoque Crítico CAF"
+                df_g1_grouped = df_g1.groupby('Parecer Logístico / Alerta')['Código MV'].count().reset_index().rename(columns={'Código MV': 'Quantidade', 'Parecer Logístico / Alerta': 'Status'})
+                df_g1_grouped = df_g1_grouped[df_g1_grouped['Status'] != 'Sem Consumo'] 
 
-                if not df_g1.empty:
-                    donut_chart = alt.Chart(df_g1).mark_arc(innerRadius=65, stroke='#fff').encode(
+                MAPA_CORES_GRAFICO = STATUS_CORES.copy()
+                MAPA_CORES_GRAFICO["Estoque Crítico CAF"] = "#FFC499"
+
+                if not df_g1_grouped.empty:
+                    donut_chart = alt.Chart(df_g1_grouped).mark_arc(innerRadius=65, stroke='#fff').encode(
                         theta=alt.Theta(field="Quantidade", type="quantitative"),
-                        color=alt.Color(field="Status", type="nominal", scale=alt.Scale(domain=list(STATUS_CORES.keys()), range=list(STATUS_CORES.values())), legend=alt.Legend(title="Parecer")),
+                        color=alt.Color(field="Status", type="nominal", scale=alt.Scale(domain=list(MAPA_CORES_GRAFICO.keys()), range=list(MAPA_CORES_GRAFICO.values())), legend=alt.Legend(title="Parecer")),
                         tooltip=['Status', 'Quantidade']
                     ).properties(height=280)
                     st.altair_chart(donut_chart, use_container_width=True)
@@ -669,14 +788,16 @@ with tab1:
 
             with g2:
                 st.markdown("**Urgência do Ressuprimento por Categoria**")
-                df_g2 = df_view[df_view['Categoria'] != 'OUTROS'].groupby(['Categoria', 'Parecer Logístico / Alerta'])['Código MV'].count().reset_index().rename(columns={'Código MV': 'Itens', 'Parecer Logístico / Alerta': 'Parecer'})
-                df_g2 = df_g2[df_g2['Parecer'] != 'Sem Consumo'].copy()
+                df_g2 = df_view[df_view['Categoria'] != 'OUTROS'].copy()
+                df_g2.loc[df_g2['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False), 'Parecer Logístico / Alerta'] = "Estoque Crítico CAF"
+                df_g2_grouped = df_g2.groupby(['Categoria', 'Parecer Logístico / Alerta'])['Código MV'].count().reset_index().rename(columns={'Código MV': 'Itens', 'Parecer Logístico / Alerta': 'Parecer'})
+                df_g2_grouped = df_g2_grouped[df_g2_grouped['Parecer'] != 'Sem Consumo'].copy()
 
-                if not df_g2.empty:
-                    stacked_chart = alt.Chart(df_g2).mark_bar().encode(
+                if not df_g2_grouped.empty:
+                    stacked_chart = alt.Chart(df_g2_grouped).mark_bar().encode(
                         x=alt.X('Itens:Q', title="Quantidade de Insumos"),
                         y=alt.Y('Categoria:N', title=None, sort='-x'),
-                        color=alt.Color('Parecer:N', scale=alt.Scale(domain=list(STATUS_CORES.keys()), range=list(STATUS_CORES.values())), legend=None),
+                        color=alt.Color('Parecer:N', scale=alt.Scale(domain=list(MAPA_CORES_GRAFICO.keys()), range=list(MAPA_CORES_GRAFICO.values())), legend=None),
                         tooltip=['Categoria', 'Parecer', 'Itens']
                     ).properties(height=280)
                     st.altair_chart(stacked_chart, use_container_width=True)
@@ -684,14 +805,14 @@ with tab1:
                     st.info("Nenhuma categoria vinculada ativa no filtro atual.")
 
             st.write("---")
-            st.markdown("#### 📋 Painel de Análise Inteligente Integrado")
+            st.markdown("#### 📋 Resultado da Análise Inteligente")
             
             with st.container(border=True):
-                st.markdown("##### 🔍 Filtros Dinâmicos da Tabela")
+                st.markdown("##### 🔍 Filtros Dinâmicos")
                 f1, f2, f3 = st.columns([2, 2, 1])
-                
                 busca_nome = f1.text_input("Filtrar por nome ou código do Insumo:", value="")
-                busca_alerta = f2.multiselect("Filtrar por Parecer Logístico:", options=list(STATUS_CORES.keys()))
+                opcoes_alertas_vivos = sorted(list(df_view['Parecer Logístico / Alerta'].unique()))
+                busca_alerta = f2.multiselect("Filtrar por Parecer Logístico:", options=opcoes_alertas_vivos)
                 busca_cat = f3.selectbox("Filtrar por Categoria:", options=["TODAS"] + list(df_view['Categoria'].unique()))
 
             if busca_nome:
@@ -716,7 +837,7 @@ with tab1:
                     "Estoque Mínimo":               st.column_config.NumberColumn("Estq Mínimo", format="%d"),
                     "Necessidade de Ressuprimento": st.column_config.NumberColumn("Necessidade Ressuprimento", format="%d"),
                     "Saldo Almox. Centrais Unificado": st.column_config.NumberColumn("Saldo Centrais", format="%d"),
-                    "Parecer Logístico / Alerta":   st.column_config.SelectboxColumn("Parecer Logístico / Alerta", width="medium", options=list(STATUS_CORES.keys())),
+                    "Parecer Logístico / Alerta":   st.column_config.TextColumn("Parecer Logístico / Alerta", width="medium"),
                 }
             )
 
@@ -725,7 +846,7 @@ with tab1:
             
             with b_p1:
                 st.download_button(
-                    label="📥 BAIXAR RELATÓRIO DO PAINEL DE ANÁLISE COMPLETO (.XLSX)",
+                    label="📥 BAIXAR RELATÓRIO COMPLETO DA ANÁLISE (.XLSX)",
                     data=exportar_excel_padronizado(st.session_state['df_final_huufma'], "Painel Geral"),
                     file_name=f"Painel_Geral_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
                     use_container_width=True,
@@ -762,6 +883,7 @@ with tab1:
                         fmt_t = wb_m.add_format({'align': 'left', 'valign': 'vcenter', 'text_wrap': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
                         fmt_h = wb_m.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'bg_color': '#1E3A8A', 'font_color': '#FFFFFF', 'border': 1, 'font_size': 11})
                         
+                        # [CORREÇÃO APLICADA]: ws_m.write substituiu o antigo writer.write
                         for ci, cn in enumerate(df_exportar.columns): ws_m.write(0, ci, cn, fmt_h)
                         ws_m.set_row(0, 40)
                         
@@ -781,10 +903,17 @@ with tab1:
                             l_col = chr(ord('A') + idx_p)
                             for status, (bg, fg) in EXCEL_CORES.items():
                                 fmt_c = wb_m.add_format({'bg_color': bg, 'font_color': fg, 'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-                                ws_m.conditional_format(1, 0, len(df_exportar), len(df_exportar.columns)-1, {'type': 'formula', 'criteria': f'=${l_col}2="{status}"', 'format': fmt_c})
+                                if status == "Estoque Crítico CAF":
+                                    ws_m.conditional_format(1, 0, len(df_exportar), len(df_exportar.columns)-1, {'type': 'cell', 'operator': 'containing', 'value': 'Estoque Crítico no Almox', 'format': fmt_c})
+                                else:
+                                    ws_m.conditional_format(1, 0, len(df_exportar), len(df_exportar.columns)-1, {'type': 'formula', 'criteria': f'=${l_col}2="{status}"', 'format': fmt_c})
+                                
+                            # [NOVA DECLARAÇÃO LOCAL DE SEGURANÇA]: Impede NameErrors ao rodar no cloud
+                            fmt_critico_caf_local = wb_m.add_format({'bg_color': '#FCE4D6', 'font_color': '#C65911', 'align': 'center', 'valign': 'vcenter', 'text_wrap': True, 'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+                            ws_m.conditional_format(1, 0, len(df_exportar), len(df_exportar.columns)-1, {'type': 'cell', 'operator': 'containing', 'value': 'Almoxarifado', 'format': fmt_critico_caf_local})
                                 
                 st.download_button(
-                    label="📥 BAIXAR EXCEL COMPLETO FRACIONADO POR ABAS DE CATEGORIA (.XLSX)",
+                    label="📥 GERAR RELATÓRIO DO PEDIDO - ABAS POR CATEGORIAS (.XLSX)",
                     data=buffer_abas.getvalue(),
                     file_name=f"Pedido_Abas_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
                     use_container_width=True,
