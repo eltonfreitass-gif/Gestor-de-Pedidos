@@ -58,7 +58,6 @@ MAPA_STATUS = {
 STATUS_CORES = {k: v[0] for k, v in MAPA_STATUS.items()}
 EXCEL_CORES  = {k: (v[1], v[2]) for k, v in MAPA_STATUS.items()}
 
-# [RESOLVIDO]: Nome corrigido ortograficamente para bater com a chamada da linha 372
 CATEGORIAS_PADRAO = sorted([
     "MEDICAMENTO", "MMH", "SORO", "NUTRIÇÃO", "GASES MEDICINAIS",
     "MATERIAL DIAGNÓSTICO", "OUTROS",
@@ -128,6 +127,7 @@ def validar_colunas(colunas: dict, contexto: str) -> bool:
 
 
 def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") -> bytes:
+    """Gera arquivos Excel com a formatação padrão exigida para todos os relatórios."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as wr:
         df_dados.to_excel(wr, sheet_name=nome_aba, index=False)
@@ -142,15 +142,20 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             ws.write(0, ci, cn, fmt_header)
         ws.set_row(0, 40)
 
+        # Mapeamento inteligente de nomes de colunas possíveis
+        col_mv = find_col(df_dados, ['codigo', 'mv', 'id']) or df_dados.columns[0]
+        col_mat = find_col(df_dados, ['material', 'produto', 'descri']) or df_dados.columns[1]
+        col_cat = find_col(df_dados, ['categoria', 'grupo']) or df_dados.columns[2]
+        col_alerta = find_col(df_dados, ['parecer', 'alerta', 'status'])
+
         LARGURAS = {
-            'Código MV': 12, 'Material': 45, 'Categoria': 16,
+            col_mv: 12, col_mat: 45, col_cat: 16,
             'Saldo Atual Satélite': 20, 'Consumo Médio Diário': 20, 'Estoque Mínimo': 16,
-            'Necessidade de Ressuprimento': 24, 'Saldo Almox. Centrais Unificado': 28,
-            'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50
+            'Saldo Almox. Centrais Unificado': 28, 'Ação Logística Sugerida': 50
         }
         for ci, cn in enumerate(df_dados.columns):
-            larg = LARGURAS.get(cn, 20)
-            fmt_col = fmt_texto if cn in ('Material', 'Ação Logística Sugerida') else fmt_base
+            larg = LARGURAS.get(cn, 24)
+            fmt_col = fmt_texto if cn in (col_mat, 'Ação Logística Sugerida') else fmt_base
             ws.set_column(ci, ci, larg, fmt_col)
 
         total_linhas = len(df_dados)
@@ -158,8 +163,9 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             ws.set_row(ri, 30)
         ws.freeze_panes(1, 0)
 
-        if 'Parecer Logístico / Alerta' in df_dados.columns:
-            idx_parecer = df_dados.columns.get_loc('Parecer Logístico / Alerta')
+        # [CORREÇÃO ABSOLUTA]: Letra calculada de forma 100% dinâmica baseada na coluna ativa detectada
+        if col_alerta:
+            idx_parecer = df_dados.columns.get_loc(col_alerta)
             letra_col = chr(ord('A') + idx_parecer)
             n_cols = len(df_dados.columns) - 1
             
@@ -177,7 +183,7 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
     if ARQUIVO_CATEGORIAS.exists():
         try:
             excel_file = pd.ExcelFile(ARQUIVO_CATEGORIAS)
-            abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x, reverse=True)
+            abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x or 'plan' in x.lower(), reverse=True)
             
             for aba in abas_ordenadas:
                 df = excel_file.parse(aba, dtype=str)
@@ -326,7 +332,7 @@ inicializar_categorias_session()
 # SIDEBAR
 # =============================================================================
 with st.sidebar:
-    st.markdown("### 🏥 Unidade & Parâmetros")
+    st.markdown("### ### 🏥 Unidade & Parâmetros")
     farmacias_opcoes = {
         "Farmácia UMI (Cód. 13)": "13",
         "Farmácia Dutra (Cód. 31)": "31",
