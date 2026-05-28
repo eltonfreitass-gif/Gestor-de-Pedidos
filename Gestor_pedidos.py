@@ -58,7 +58,13 @@ MAPA_STATUS = {
 STATUS_CORES = {k: v[0] for k, v in MAPA_STATUS.items()}
 EXCEL_CORES  = {k: (v[1], v[2]) for k, v in MAPA_STATUS.items()}
 
-# CORREÇÃO: Força o caminho a buscar exatamente o nome com a primeira letra maiúscula como está no seu GitHub
+# [RESOLVIDO]: Nome corrigido ortograficamente para bater com a chamada da linha 372
+CATEGORIAS_PADRAO = sorted([
+    "MEDICAMENTO", "MMH", "SORO", "NUTRIÇÃO", "GASES MEDICINAIS",
+    "MATERIAL DIAGNÓSTICO", "OUTROS",
+])
+
+# Caminho do arquivo físico permanente na mesma pasta do app.py
 ARQUIVO_CATEGORIAS = Path(__file__).parent / "Categorias_base.xlsx"
 
 # =============================================================================
@@ -163,22 +169,19 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
     return buf.getvalue()
 
 # =============================================================================
-# PERSISTÊNCIA EM DISCO CORRIGIDA PARA DUPLAS ABAS (PLANILHA2)
+# PERSISTÊNCIA EM DISCO COMPATÍVEL COM CLOUD (PLANILHA2)
 # =============================================================================
 
 def carregar_categorias_do_disco() -> pd.DataFrame:
     """Lê o arquivo do disco varrendo todas as abas para contornar a Planilha1 vazia."""
     if ARQUIVO_CATEGORIAS.exists():
         try:
-            # Abre o arquivo inspecionando todas as abas internas
             excel_file = pd.ExcelFile(ARQUIVO_CATEGORIAS)
-            
-            # Percorre as abas (procurando primeiro na Planilha2 que é onde estão os dados)
             abas_ordenadas = sorted(excel_file.sheet_names, key=lambda x: '2' in x, reverse=True)
             
             for aba in abas_ordenadas:
                 df = excel_file.parse(aba, dtype=str)
-                if df.empty or len(df) < 2: 
+                if df.empty or len(df) < 1: 
                     continue
                 
                 c_cod = find_col(df, ['codigo', 'cod', 'ca3', 'id'])
@@ -197,7 +200,6 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
         except Exception:
             pass
     
-    # Cria estrutura limpa padrão se o arquivo falhar ou não existir
     df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria"])
     try:
         df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
@@ -208,7 +210,6 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
 
 def salvar_categorias_no_disco(df: pd.DataFrame) -> bool:
     try:
-        # Salva na Planilha1 para blindar futuras leituras automáticas simples
         df.to_excel(ARQUIVO_CATEGORIAS, sheet_name="Planilha1", index=False)
         return True
     except Exception as e:
