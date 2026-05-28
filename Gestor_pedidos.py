@@ -493,37 +493,51 @@ with tab2:
         )
         arq_import = st.file_uploader("Selecionar arquivo:", type=["xlsx", "csv"], key="import_cat")
         if arq_import:
-            try:
-                if arq_import.name.endswith(".csv"):
-                    df_import = pd.read_csv(io.BytesIO(arq_import.read()), sep=None,
-                                            engine='python', dtype=str)
-                else:
-                    df_import = pd.read_excel(io.BytesIO(arq_import.read()), dtype=str)
+            with st.status("⏳ Processando arquivo de categorias...", expanded=True) as status_import:
+                try:
+                    st.write("📂 Lendo o arquivo...")
+                    if arq_import.name.endswith(".csv"):
+                        df_import = pd.read_csv(io.BytesIO(arq_import.read()), sep=None,
+                                                engine='python', dtype=str)
+                    else:
+                        df_import = pd.read_excel(io.BytesIO(arq_import.read()), dtype=str)
 
-                col_cod_i = find_col(df_import, ['cod', 'ca3'])
-                col_cat_i = find_col(df_import, ['categ'])
-                col_mat_i = find_col(df_import, ['descri', 'material', 'produto', 'nome'])
+                    st.write(f"🔍 Identificando colunas em `{arq_import.name}`...")
+                    col_cod_i = find_col(df_import, ['cod', 'ca3'])
+                    col_cat_i = find_col(df_import, ['categ'])
+                    col_mat_i = find_col(df_import, ['descri', 'material', 'produto', 'nome'])
 
-                if not col_cod_i or not col_cat_i:
-                    st.error("❌ Arquivo precisa ter colunas reconhecíveis de 'Código' e 'Categoria'.")
-                else:
-                    df_imp_clean = pd.DataFrame({
-                        "Código":    df_import[col_cod_i].apply(clean_key),
-                        "Material":  df_import[col_mat_i].fillna("").astype(str) if col_mat_i else "",
-                        "Categoria": df_import[col_cat_i].str.upper().str.strip(),
-                    })
-                    df_imp_clean = df_imp_clean[df_imp_clean["Código"] != ""]
+                    if not col_cod_i or not col_cat_i:
+                        status_import.update(label="❌ Colunas não identificadas", state="error")
+                        st.error("O arquivo precisa ter colunas reconhecíveis de **Código** e **Categoria**.")
+                    else:
+                        st.write("🔄 Normalizando e mesclando com a base atual...")
+                        df_imp_clean = pd.DataFrame({
+                            "Código":    df_import[col_cod_i].apply(clean_key),
+                            "Material":  df_import[col_mat_i].fillna("").astype(str) if col_mat_i else "",
+                            "Categoria": df_import[col_cat_i].str.upper().str.strip(),
+                        })
+                        df_imp_clean = df_imp_clean[df_imp_clean["Código"] != ""]
 
-                    # Merge: atualiza existentes e adiciona novos
-                    df_base = st.session_state["df_categorias"].copy()
-                    df_merged = pd.concat([df_base, df_imp_clean], ignore_index=True)
-                    df_merged = df_merged.drop_duplicates("Código", keep="last")
-                    st.session_state["df_categorias"] = df_merged.reset_index(drop=True)
+                        novos     = df_imp_clean[~df_imp_clean["Código"].isin(
+                                        st.session_state["df_categorias"]["Código"])]["Código"].count()
+                        atualizados = len(df_imp_clean) - novos
 
-                    st.success(f"✅ {len(df_imp_clean)} itens importados/atualizados com sucesso!")
-                    st.rerun()
-            except Exception as e:
-                st.error(f"❌ Erro ao importar: {e}")
+                        # Merge: atualiza existentes e adiciona novos
+                        df_base   = st.session_state["df_categorias"].copy()
+                        df_merged = pd.concat([df_base, df_imp_clean], ignore_index=True)
+                        df_merged = df_merged.drop_duplicates("Código", keep="last")
+                        st.session_state["df_categorias"] = df_merged.reset_index(drop=True)
+
+                        st.write(f"✅ **{novos} novos itens** adicionados · **{atualizados} itens** atualizados.")
+                        status_import.update(
+                            label=f"✅ Importação concluída — {len(df_imp_clean)} itens processados",
+                            state="complete", expanded=False
+                        )
+                        st.rerun()
+                except Exception as e:
+                    status_import.update(label="❌ Erro durante a importação", state="error")
+                    st.error(f"Detalhe técnico: `{e}`")
 
     st.write("")
 
