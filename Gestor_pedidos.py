@@ -338,22 +338,15 @@ def definir_alerta_e_acao(row: pd.Series, dict_saldos_centrais: dict, dict_saldo
             excedente = int(est_un - est_minimo)
             return "Estoque Parado", f"{excedente} unidades acima do estoque mínimo. Considerar devolver ou remanejar para outra farmácia."
             
+    # Variável de prefixo: adiciona contexto visual de urgência quando aplicável
+    prefixo_alerta = ""
     if sug > 0 and est_un < est_minimo:
-        return "Estoque em Alerta", "Estoque abaixo do mínimo de segurança. Abastecer urgentemente!."
+        prefixo_alerta = "[ALERTA - ABAIXO DO MÍNIMO] "
         
     if sug <= 0:
         return "Estoque Suficiente", "Estoque dentro da cobertura ideal."
 
-    saldos_nas_centrais = dict_saldos_centrais.get(cod, {})
-    saldo_total_central = sum(saldos_nas_centrais.values())
-
-    if saldo_total_central > 0:
-        central_principal = max(saldos_nas_centrais, key=saldos_nas_centrais.get)
-        if saldo_total_central >= sug:
-            return "Solicitar", f"Solicitar {int(sug)} un. ao Almoxarifado Central {central_principal}."
-        else:
-            return f"Estoque Crítico no Almoxarifado {central_principal}", f"Pegar {int(saldo_total_central)} un. no Almox Central {central_principal} e remanejar o restante."
-
+    # Processa disponibilidade nas parceiras primeiro, para ter a informação pronta
     saldos_parceiras = dict_saldos_parceiras.get(cod, {})
     consumos_parceiras = consumo_outras_total.get(cod, {})
 
@@ -364,12 +357,33 @@ def definir_alerta_e_acao(row: pd.Series, dict_saldos_centrais: dict, dict_saldo
             if c_parc == 0 or saldo_f > (c_parc * 3):
                 nome_pratico = DIC_NOMES_FARMACIAS.get(str(farm_id), "Farmácia Satélite")
                 farmacias_com_estoque_parado.append(f"Cód {farm_id} ({nome_pratico} - {int(saldo_f)} un.)")
+    
+    locais_remanejo = " | ".join(farmacias_com_estoque_parado)
 
+    # Processa disponibilidade nas Centrais
+    saldos_nas_centrais = dict_saldos_centrais.get(cod, {})
+    saldo_total_central = sum(saldos_nas_centrais.values())
+
+    # Se a central possui algo, avalia se é total ou parcial
+    if saldo_total_central > 0:
+        central_principal = max(saldos_nas_centrais, key=saldos_nas_centrais.get)
+        if saldo_total_central >= sug:
+            return "Solicitar", f"{prefixo_alerta}Solicitar {int(sug)} un. ao Almoxarifado Central {central_principal}."
+        else:
+            faltante = int(sug - saldo_total_central)
+            if farmacias_com_estoque_parado:
+                # O cenário corrigido: tem na central parcialmente, e TEM parceira para cobrir o resto
+                return f"Estoque Crítico no Almoxarifado {central_principal}", f"{prefixo_alerta}Pegar {int(saldo_total_central)} un. no Almox Central {central_principal} e remanejar o restante ({faltante} un.) de: {locais_remanejo}."
+            else:
+                # O cenário corrigido: tem na central parcialmente, mas NÃO TEM parceira para cobrir o resto
+                return f"Estoque Crítico no Almoxarifado {central_principal}", f"{prefixo_alerta}Pegar {int(saldo_total_central)} un. no Almox Central {central_principal}. ALERTA: Sem saldo nas farmácias parceiras para cobrir as {faltante} un. restantes."
+
+    # Se a central está zerada, verifica se tem como remanejar
     if farmacias_com_estoque_parado:
-        locais = " | ".join(farmacias_com_estoque_parado)
-        return "Remanejar", f"Central Zerada! Transferir de: {locais}."
+        return "Remanejar", f"{prefixo_alerta}Central Zerada! Transferir de: {locais_remanejo}."
 
-    return "Desabastecimento Crítico", "Sem saldo nos almoxarifados e sem estoque parado nas farmácias."
+    # Se não houver nem na central, nem nas parceiras, é Ruptura.
+    return "Desabastecimento Crítico", f"{prefixo_alerta}Sem saldo nos almoxarifados e sem estoque parado nas farmácias."
 
 # Inicializa banco de dados local unificado
 inicializar_categorias_session()
@@ -414,9 +428,9 @@ with st.sidebar:
         * **Condição:** Giro zerado ($CMD = 0$), mas possui saldo físico na farmácia satélite.
         * **Ação Logística:** Avisa o volume em excesso acima do estoque mínimo e sugere remanejamento externo.
         
-        #### 4. 🟡 Estoque em Alerta
-        * **Condição:** A farmácia precisa de material ($Sugestão > 0$), mas o seu saldo atual já caiu abaixo do estoque mínimo de segurança parametrizado.
-        * **Ação Logística:** *\"Estoque abaixo do mínimo de segurança. Abastecer urgentemente!.\"*
+        #### 4. 🟡 Estoque em Alerta (Integrado ao Fluxo)
+        * **Condição:** A farmácia precisa de material ($Sugestão > 0$) e o saldo atual caiu abaixo do estoque mínimo de segurança.
+        * **Ação Logística:** O item é encaminhado normalmente para a lista de **Solicitação**, **Remanejamento** ou **Ruptura** (dependendo da disponibilidade da rede), mas recebe a marcação urgente **[ALERTA - ABAIXO DO MÍNIMO]** na descrição da sua ação sugerida.
         
         #### 5. 🟢 Estoque Suficiente
         * **Condição:** O saldo cobre a janela histórica e está acima da margem de segurança.
@@ -427,7 +441,7 @@ with st.sidebar:
         
         #### 7. 🟠 Estoque Crítico no Almoxarifado X
         * **Condição:** Pedido $> 0$, mas a central específica de número X possui saldo parcial e insuficiente.
-        * **Ação Logística:** Orienta raspar a central X e capturar o saldo restante via remanejamento.
+        * **Ação Logística:** Orienta raspar a central X e informa exatamente de quais farmácias satélites capturar o saldo restante via remanejamento.
         
         #### 8. 🟡 Remanejar entre Farmácias
         * **Condição:** Centrais zeradas, mas existem outras farmácias satélites com saldo parado ou excedente.
@@ -745,7 +759,7 @@ with tab1:
             df_caf_disp = df_view[df_view['Parecer Logístico / Alerta'].str.contains("Solicitar|Almoxarifado", na=False)].sort_values('Material')
             
             df_excesso = df_view[
-                (df_view['Parecer Logístico / Alerta'].isin(["Estoque Excessivo", "Estoque Parado", "Sem Consumo", "Estoque em Alerta"])) &
+                (df_view['Parecer Logístico / Alerta'].isin(["Estoque Excessivo", "Estoque Parado", "Sem Consumo"])) &
                 (df_view['Parecer Logístico / Alerta'] != "Sem Consumo")
             ].sort_values('Material')
 
@@ -760,7 +774,7 @@ with tab1:
                 st.metric("📦 Disponível no Almoxarifado", f"{len(df_caf_disp)} itens")
                 st.download_button("📥 Extrair Lista", data=exportar_excel_padronizado(df_caf_disp, "Disponiveis_CAF"), file_name=f"Disponiveis_Centrais_{cod_farmacia_alvo}.xlsx", key="ex_c3", use_container_width=True)
             with c4:
-                st.metric("⚠️Atenção! (Excesso/Crítico/Sem Giro)", f"{len(df_excesso)} itens")
+                st.metric("⚠️Atenção! (Excesso/Sem Giro)", f"{len(df_excesso)} itens")
                 st.download_button("📥 Extrair Lista", data=exportar_excel_padronizado(df_excesso, "Riscos_Excesso"), file_name=f"Overstock_{cod_farmacia_alvo}.xlsx", key="ex_c4", use_container_width=True)
 
             st.write("")
