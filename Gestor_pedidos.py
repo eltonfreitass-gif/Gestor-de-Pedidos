@@ -171,6 +171,7 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
         wb = wr.book
         ws = wr.sheets[nome_aba]
 
+        # Alinhamento vertical alterado de 'vcenter' para 'top'
         fmt_base   = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
                                     'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
         fmt_texto  = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
@@ -200,9 +201,8 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             fmt_col = fmt_texto if cn in (col_mat, 'Ação Logística Sugerida') else fmt_base
             ws.set_column(ci, ci, larg, fmt_col)
 
+        # Retirada a trava de altura fixa da linha. O Excel calculará sozinho pelo text_wrap
         total_linhas = len(df_dados)
-        for ri in range(1, total_linhas + 1):
-            ws.set_row(ri, 30)
         ws.freeze_panes(1, 0)
 
         if col_alerta:
@@ -231,6 +231,7 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
 
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
         wb     = writer.book
+        # Alinhamento vertical alterado de 'vcenter' para 'top'
         fmt_b  = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
                                  'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
         fmt_t  = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
@@ -265,8 +266,7 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
                 ws.set_column(ci, ci, larg, fmt_col)
 
             total_l = len(df_exp)
-            for ri in range(1, total_l + 1):
-                ws.set_row(ri, 30)
+            # Retirada a trava de altura fixa da linha. O Excel calculará sozinho pelo text_wrap
             ws.freeze_panes(1, 0)
 
             if col_alerta in df_exp.columns:
@@ -346,39 +346,6 @@ def obter_mapa_categorias() -> dict:
     if df.empty:
         return {}
     return dict(zip(df["Código"].astype(str), df["Categoria"].astype(str)))
-
-
-def enriquecer_e_auto_preencher_categorias(df_est: pd.DataFrame, c_est_cod: str, c_est_prod: str):
-    df_cat = st.session_state.get("df_categorias", pd.DataFrame()).copy()
-    df_est_unicos = df_est.drop_duplicates(subset=["key"]).copy()
-
-    mapa_desc = dict(zip(
-        df_est_unicos["key"].astype(str),
-        df_est_unicos[c_est_prod].fillna("").astype(str).str.strip()
-    ))
-    if not df_cat.empty:
-        mask_vazio = (
-            df_cat["Material"].astype(str).str.strip().eq("") |
-            df_cat["Material"].astype(str).str.upper().eq("PRODUTO SEM DESCRIÇÃO")
-        )
-        df_cat.loc[mask_vazio, "Material"] = (
-            df_cat.loc[mask_vazio, "Código"].astype(str).map(mapa_desc)
-            .fillna(df_cat.loc[mask_vazio, "Material"])
-        )
-
-    codigos_existentes = set(df_cat["Código"].astype(str).tolist())
-    df_novos_raw = df_est_unicos[~df_est_unicos["key"].astype(str).isin(codigos_existentes)]
-    if not df_novos_raw.empty:
-        df_novos = pd.DataFrame({
-            "Código":    df_novos_raw["key"].astype(str).values,
-            "Material":  df_novos_raw[c_est_prod].fillna("").astype(str).str.strip().values,
-            "Categoria": "OUTROS",
-        })
-        df_cat = pd.concat([df_cat, df_novos], ignore_index=True)
-
-    df_cat = df_cat.drop_duplicates("Código", keep="last").reset_index(drop=True)
-    st.session_state["df_categorias"] = df_cat
-    salvar_categorias_no_disco(df_cat)
 
 
 # =============================================================================
@@ -634,7 +601,7 @@ with st.sidebar:
         * Elton Jonh Freitas Santos
         * Farmacêutico - Chefe da UDIS/HUUFMA
 
-        *HUUFMA — Gestor do Estoque e Inteligência Logística © 2026*
+        *HUUFMA — Gestão e Inteligência Logística © 2026*
         """)
 
 
@@ -659,7 +626,7 @@ tab1, tab2 = st.tabs(["⚡ Processar Pedido com IA Logística", "🗂️ Gestão
 with tab2:
     st.subheader("🗂️ Mapeamento Global de Categorias")
     st.info(
-        "A tabela serve como **De/Para** para classificar os itens no momento da análise. "
+        "A tabela serve como De/Para para classificar os itens no momento da análise."
         )
 
     df_cat_atual = st.session_state["df_categorias"].copy()
@@ -708,7 +675,7 @@ with tab2:
         )
 
         col_salvar, col_reset = st.columns([4, 1])
-        if col_salvar.button("💾 SALVAR ALTERAÇÕES", use_container_width=True):
+        if col_salvar.button("💾 SALVAR ALTERAÇÕES PERMANENTEMENTE", use_container_width=True):
             codigos_visiveis = set(df_filtrado_cat["Código"].astype(str).tolist())
             df_base = st.session_state["df_categorias"].copy()
             df_base_limpo = df_base[~df_base["Código"].astype(str).isin(codigos_visiveis)]
@@ -990,7 +957,6 @@ with tab1:
 
                 final = pd.DataFrame({'Código MV': todos_codigos})
                 
-                # A descrição agora vem unicamente do AGHU. Não tentamos mais cruzar ou reparar com o arquivo de categorias.
                 final['Material']              = final['Código MV'].map(mapa_produtos).fillna('PRODUTO SEM DESCRIÇÃO')
                 
                 final['Saldo Atual Satélite']  = final['Código MV'].map(est_farmacia_alvo).fillna(0)
@@ -1007,11 +973,9 @@ with tab1:
                 final['Tendência']   = [r[0] for r in tend_resultados]
                 final['Δ% Tendência'] = [r[1] for r in tend_resultados]
 
-                # Categorias mapeadas apenas como consulta
                 mapa_cat = obter_mapa_categorias()
                 final['Categoria'] = final['Código MV'].map(mapa_cat).fillna('OUTROS')
 
-                # Diagnóstico de cobertura do mapeamento
                 total_itens   = len(final)
                 itens_mapeados = final['Categoria'].ne('OUTROS').sum()
                 itens_outros   = total_itens - itens_mapeados
@@ -1087,7 +1051,7 @@ with tab1:
             df_excesso  = df_view[df_view['Parecer Logístico / Alerta'].isin(
                 ["Estoque Excessivo", "Estoque Parado"]
             )].sort_values('Material')
-
+            
             c0, c1, c2, c3, c4 = st.columns(5)
             c0.metric("📅 Dias Efetivos de Consumo",
                       f"{n_dias_efetivos} dias",
@@ -1161,7 +1125,6 @@ with tab1:
                         y=alt.Y('Categoria:N', title=None)
                     )
 
-                    # A opacidade voltou para dar o efeito de gradiente visual dependendo do volume de itens
                     heatmap = base.mark_rect(cornerRadius=6, stroke='white', strokeWidth=3).encode(
                         color=alt.Color('Parecer:N', scale=alt.Scale(
                             domain=list(MAPA_CORES_GRAFICO.keys()),
@@ -1195,7 +1158,7 @@ with tab1:
 
             # ── PAINEL INTERATIVO ─────────────────────────────────────────
             st.write("---")
-            st.markdown("#### 📋 Resultado da Análise")
+            st.markdown("#### 📋 Resultado da Análise Inteligente")
 
             with st.container(border=True):
                 st.markdown("##### 🔍 Filtros Dinâmicos")
@@ -1215,6 +1178,7 @@ with tab1:
                 df_filtrado = df_filtrado[df_filtrado['Parecer Logístico / Alerta'].isin(busca_alerta)]
             if busca_cat != "TODAS":
                 df_filtrado = df_filtrado[df_filtrado['Categoria'] == busca_cat]
+                df_exibicao = df_filtrado[ordem_cols].sort_values('Material')
 
             st.dataframe(
                 df_filtrado.sort_values('Material'),
@@ -1222,14 +1186,15 @@ with tab1:
                 column_config={
                     "Código MV":               st.column_config.TextColumn("Código MV", width="small"),
                     "Material":                st.column_config.TextColumn("Descrição", width="large"),
-                    "Saldo Atual Satélite":    st.column_config.NumberColumn("Saldo", format="%d"),
-                    "Consumo Médio Diário":    st.column_config.NumberColumn("CMD", format="%d"),
+                    "Categoria":               st.column_config.TextColumn("Categoria", width="medium"),
                     "Estoque Mínimo":          st.column_config.NumberColumn("Mínimo", format="%d"),
+                    "Saldo Atual Satélite":    st.column_config.NumberColumn("Saldo", format="%d"),
                     "Cobertura (dias)":        st.column_config.TextColumn("Cobertura", width="small"), # Modificado para aceitar Textos
-                    "CMD Últ. 3 dias":         st.column_config.NumberColumn("CMD 3 dias", format="%d"),
+                    "CMD Últ. 3 dias":         st.column_config.NumberColumn("CMD 3 dias", format="%d"),                    
+                    "Consumo Médio Diário":    st.column_config.NumberColumn("CMD", format="%d"),
+                    "Necessidade de Ressuprimento": st.column_config.NumberColumn("Necessidade", format="%d"),                    
                     "Tendência":               st.column_config.TextColumn("Tend.", width="small"),
                     "Δ% Tendência":            st.column_config.TextColumn("Δ%", width="small"),
-                    "Necessidade de Ressuprimento": st.column_config.NumberColumn("Necessidade", format="%d"),
                     "Saldo Almox. Centrais Unificado": st.column_config.NumberColumn("Saldo Central", format="%d"),
                     "Parecer Logístico / Alerta": st.column_config.TextColumn("Parecer", width="medium"),
                 }
@@ -1242,13 +1207,16 @@ with tab1:
                 'Necessidade de Ressuprimento': COL_SUG
             })
             ordem_cols = [
-                'Código MV', 'Material', 'Categoria',
-                'Saldo Atual Satélite', 'Consumo Médio Diário',
-                'Cobertura (dias)', 'CMD Últ. 3 dias', 'Tendência', 'Δ% Tendência',
-                'Estoque Mínimo', COL_SUG,
-                'Saldo Almox. Centrais Unificado',
+                'Código MV', 'Material', 'Categoria', 'Estoque Mínimo', 'Saldo Atual Satélite', 'Cobertura (dias)',
+                'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG, 'Tendência', 'Δ% Tendência', 'Saldo Almox. Centrais Unificado',
                 'Parecer Logístico / Alerta', 'Ação Logística Sugerida',
             ]
+
+            # 2. O [ordem_cols] no final "trava" o DataFrame nessa sequência exata
+            df_export = st.session_state['df_final_huufma'].rename(columns={
+                'Necessidade de Ressuprimento': COL_SUG
+            })[ordem_cols]
+
             larguras_rel = {
                 'Código MV': 12, 'Material': 45, 'Categoria': 16,
                 'Saldo Atual Satélite': 18, 'Consumo Médio Diário': 18,
