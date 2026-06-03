@@ -1044,6 +1044,32 @@ with tab1:
                         f"🏷️ **Categorias:** 100% dos {diag['total']} itens classificados."
                     )
 
+            # ── ORDEM DE COLUNAS — definida aqui, usada em TODOS os downloads ─
+            COL_SUG = f'Necessidade de Ressuprimento ({dias_pedido} dias)'
+            ordem_cols = [
+                'Código MV', 'Material', 'Categoria',
+                'Estoque Mínimo', 'Saldo Atual Satélite', 'Cobertura (dias)',
+                'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG,
+                'Tendência', 'Δ% Tendência',
+                'Saldo Almox. Centrais Unificado',
+                'Parecer Logístico / Alerta', 'Ação Logística Sugerida',
+            ]
+            larguras_rel = {
+                'Código MV': 12, 'Material': 45, 'Categoria': 16,
+                'Estoque Mínimo': 16, 'Saldo Atual Satélite': 18,
+                'Cobertura (dias)': 14, 'CMD Últ. 3 dias': 16,
+                'Consumo Médio Diário': 18, COL_SUG: 26,
+                'Tendência': 10, 'Δ% Tendência': 12,
+                'Saldo Almox. Centrais Unificado': 28,
+                'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
+            }
+
+            def _preparar_df_card(df_raw: pd.DataFrame) -> pd.DataFrame:
+                """Renomeia e aplica ordem_cols em um subconjunto do painel."""
+                df = df_raw.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
+                cols_ok = [c for c in ordem_cols if c in df.columns]
+                return df[cols_ok]
+
             # ── MÉTRICAS ─────────────────────────────────────────────────
             df_desabast = df_view[df_view['Parecer Logístico / Alerta'] == "Desabastecimento Crítico"].sort_values('Material')
             df_remanej  = df_view[df_view['Parecer Logístico / Alerta'] == "Remanejar"].sort_values('Material')
@@ -1059,19 +1085,19 @@ with tab1:
                       delta_color="inverse" if datas_vazias else "normal")
             with c1:
                 st.metric("🚨 Desabastecimento Crítico", f"{len(df_desabast)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(df_desabast, "Rupturas"),
+                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_desabast), "Rupturas"),
                     file_name=f"Rupturas_{cod_farmacia_alvo}.xlsx", key="ex_c1", use_container_width=True)
             with c2:
                 st.metric("🔄 Remanejamento Potencial", f"{len(df_remanej)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(df_remanej, "Remanejamento"),
+                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_remanej), "Remanejamento"),
                     file_name=f"Remanejamento_{cod_farmacia_alvo}.xlsx", key="ex_c2", use_container_width=True)
             with c3:
                 st.metric("📦 Disponível no Almoxarifado", f"{len(df_caf)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(df_caf, "Disponiveis_CAF"),
+                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_caf), "Disponiveis_CAF"),
                     file_name=f"Disponiveis_{cod_farmacia_alvo}.xlsx", key="ex_c3", use_container_width=True)
             with c4:
                 st.metric("⚠️ Excesso / Sem Giro", f"{len(df_excesso)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(df_excesso, "Overstock"),
+                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_excesso), "Overstock"),
                     file_name=f"Overstock_{cod_farmacia_alvo}.xlsx", key="ex_c4", use_container_width=True)
 
             # ── GRÁFICOS APRIMORADOS ──────────────────────────────────────
@@ -1202,30 +1228,10 @@ with tab1:
 
             # ── DOWNLOADS ─────────────────────────────────────────────────
             st.write("")
-            COL_SUG = f'Necessidade de Ressuprimento ({dias_pedido} dias)'
-            df_export = st.session_state['df_final_huufma'].rename(columns={
-                'Necessidade de Ressuprimento': COL_SUG
-            })
-            ordem_cols = [
-                'Código MV', 'Material', 'Categoria', 'Estoque Mínimo', 'Saldo Atual Satélite', 'Cobertura (dias)',
-                'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG, 'Tendência', 'Δ% Tendência', 'Saldo Almox. Centrais Unificado',
-                'Parecer Logístico / Alerta', 'Ação Logística Sugerida',
-            ]
-
-            # 2. O [ordem_cols] no final "trava" o DataFrame nessa sequência exata
-            df_export = st.session_state['df_final_huufma'].rename(columns={
-                'Necessidade de Ressuprimento': COL_SUG
-            })[ordem_cols]
-
-            larguras_rel = {
-                'Código MV': 12, 'Material': 45, 'Categoria': 16,
-                'Saldo Atual Satélite': 18, 'Consumo Médio Diário': 18,
-                'Cobertura (dias)': 14, 'CMD Últ. 3 dias': 16,
-                'Tendência': 10, 'Δ% Tendência': 12,
-                'Estoque Mínimo': 16, COL_SUG: 26,
-                'Saldo Almox. Centrais Unificado': 28,
-                'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
-            }
+            # df_export usa COL_SUG, ordem_cols e larguras_rel definidos acima
+            df_export = st.session_state['df_final_huufma'].rename(
+                columns={'Necessidade de Ressuprimento': COL_SUG}
+            )[ordem_cols]
 
             b1, b2, b3 = st.columns(3)
             with b1:
