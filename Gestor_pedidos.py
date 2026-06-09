@@ -171,7 +171,7 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
         wb = wr.book
         ws = wr.sheets[nome_aba]
 
-        # Alinhamento vertical alterado de 'vcenter' para 'top'
+        # Alinhamento vertical centralizado para melhor UX com altura dinâmica
         fmt_base   = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
                                     'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
         fmt_texto  = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
@@ -195,13 +195,14 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
             'Estoque Mínimo': 16, 'Cobertura (dias)': 14,
             'CMD Últ. 3 dias': 16, 'Tendência': 12, 'Δ% Tendência': 12,
             'Saldo Almox. Centrais Unificado': 28, 'Ação Logística Sugerida': 50,
+            'PEDIDO (X DIAS)': 20
         }
         for ci, cn in enumerate(df_dados.columns):
             larg    = LARGURAS_PAD.get(cn, 24)
             fmt_col = fmt_texto if cn in (col_mat, 'Ação Logística Sugerida') else fmt_base
             ws.set_column(ci, ci, larg, fmt_col)
 
-        # Retirada a trava de altura fixa da linha. O Excel calculará sozinho pelo text_wrap
+        # Sem trava de altura para permitir autoajuste do Excel
         total_linhas = len(df_dados)
         ws.freeze_panes(1, 0)
 
@@ -231,7 +232,7 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
 
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
         wb     = writer.book
-        # Alinhamento vertical alterado de 'vcenter' para 'top'
+        # Alinhamento vertical centralizado
         fmt_b  = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
                                  'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
         fmt_t  = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
@@ -245,8 +246,9 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
 
         for cat, df_cat in df_total.groupby(col_categoria):
             df_exp = df_cat.copy()
-            if excluir_acoes:
+            if excluir_acoes and 'Ação Logística Sugerida' in df_exp.columns:
                 df_exp = df_exp[~df_exp['Ação Logística Sugerida'].isin(excluir_acoes)]
+                
             cols_ok = [c for c in ordem_cols if c in df_exp.columns]
             df_exp  = df_exp[cols_ok].sort_values('Material').copy()
             if df_exp.empty:
@@ -266,7 +268,6 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
                 ws.set_column(ci, ci, larg, fmt_col)
 
             total_l = len(df_exp)
-            # Retirada a trava de altura fixa da linha. O Excel calculará sozinho pelo text_wrap
             ws.freeze_panes(1, 0)
 
             if col_alerta in df_exp.columns:
@@ -360,34 +361,31 @@ def calcular_cmd(qtd_total: float, dias_com_movimento: int) -> float:
 def calcular_tendencia(mov_filtrado: pd.DataFrame, c_mov_cod: str,
                         c_mov_qtd: str, c_mov_data: str,
                         n_dias: int = JANELA_TENDENCIA_DIAS) -> pd.DataFrame:
-    if mov_filtrado.empty:
-        return pd.DataFrame(columns=['key', 'cmd_tendencia'])
-
-    dias_com_mv = sorted(
-        mov_filtrado['dt_formatada'].dt.date.dropna().unique(),
-        reverse=True
-    )
-    ultimos_n_dias = dias_com_mv[:n_dias]
+    # 1. Identificar o período exato que estamos olhando (Lógica ajustada para 0)
+    datas_unicas = sorted(mov_filtrado['dt_formatada'].dt.date.unique(), reverse=True)
+    ultimos_n_dias = datas_unicas[:n_dias]
 
     if not ultimos_n_dias:
         return pd.DataFrame(columns=['key', 'cmd_tendencia'])
 
-    mov_tend = mov_filtrado[
-        mov_filtrado['dt_formatada'].dt.date.isin(ultimos_n_dias)
-    ].copy()
+    # 2. Filtrar apenas o movimento desses dias
+    mov_tend = mov_filtrado[mov_filtrado['dt_formatada'].dt.date.isin(ultimos_n_dias)].copy()
 
+    # 3. Agrupar somando o consumo
     consumo_tend = (
         mov_tend
         .assign(qtd_num=lambda df: df[c_mov_qtd].apply(p_num))
         .assign(key=lambda df: df[c_mov_cod].apply(clean_key))
         .groupby('key')['qtd_num'].sum()
         .reset_index()
-        .rename(columns={'qtd_num': 'total_tend'})
     )
+
+    # 4. Tratamos o resultado matematicamente
     n_dias_reais = len(ultimos_n_dias)
-    consumo_tend['cmd_tendencia'] = consumo_tend['total_tend'].apply(
-        lambda x: float(math.ceil(x / n_dias_reais)) if x > 0 else 0.0
+    consumo_tend['cmd_tendencia'] = consumo_tend['qtd_num'].apply(
+        lambda x: float(math.ceil(x / n_dias_reais))
     )
+    
     return consumo_tend[['key', 'cmd_tendencia']]
 
 
@@ -558,7 +556,7 @@ with st.sidebar:
         * **Condição:** CMD = 0, Estoque Mínimo = 0 e Saldo = 0.
         * **Ação:** Avaliar inativação do item.
 
-        #### 2. 🔵 Estoque Excessivo
+        #### 2. 🩵 Estoque Excessivo
         * **Condição:** CMD > 0 com cobertura > 60 dias.
         * **Ação:** Devolver ao almoxarifado.
 
@@ -847,7 +845,8 @@ with tab1:
                 progress.progress(40, text="📊 Calculando consumo e auditando calendário...")
 
                 mov = mov.copy()
-                mov['dt_formatada'] = pd.to_datetime(mov[c_mov_data], dayfirst=True, errors='coerce')
+                # Correção do dayfirst=True
+                mov['dt_formatada'] = pd.to_datetime(mov[c_mov_data], errors='coerce')
                 mov_filtrado = mov[
                     (mov['dt_formatada'].dt.date >= data_inicio) &
                     (mov['dt_formatada'].dt.date <= data_fim) &
@@ -904,8 +903,9 @@ with tab1:
                                 continue
 
                             df_p = df_p.copy()
+                            # Correção do dayfirst=True
                             df_p['dt_formatada'] = pd.to_datetime(
-                                df_p[c_p_data], dayfirst=True, errors='coerce'
+                                df_p[c_p_data], errors='coerce'
                             )
                             df_p_filt = df_p[
                                 (df_p['dt_formatada'].dt.date >= data_inicio) &
@@ -1044,7 +1044,7 @@ with tab1:
                         f"🏷️ **Categorias:** 100% dos {diag['total']} itens classificados."
                     )
 
-            # ── ORDEM DE COLUNAS — definida aqui, usada em TODOS os downloads ─
+            # ── DEFINIÇÃO DAS VARIÁVEIS DE ORDEM PARA TODOS OS DOWNLOADS E PAINEL ──
             COL_SUG = f'Necessidade de Ressuprimento ({dias_pedido} dias)'
             ordem_cols = [
                 'Código MV', 'Material', 'Categoria',
@@ -1058,14 +1058,13 @@ with tab1:
                 'Código MV': 12, 'Material': 45, 'Categoria': 16,
                 'Estoque Mínimo': 16, 'Saldo Atual Satélite': 18,
                 'Cobertura (dias)': 14, 'CMD Últ. 3 dias': 16,
-                'Consumo Médio Diário': 18, COL_SUG: 26,
+                'Consumo Médio Diário': 18, COL_SUG: 26, 'PEDIDO (X DIAS)': 20,
                 'Tendência': 10, 'Δ% Tendência': 12,
                 'Saldo Almox. Centrais Unificado': 28,
                 'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
             }
 
             def _preparar_df_card(df_raw: pd.DataFrame) -> pd.DataFrame:
-                """Renomeia e aplica ordem_cols em um subconjunto do painel."""
                 df = df_raw.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
                 cols_ok = [c for c in ordem_cols if c in df.columns]
                 return df[cols_ok]
@@ -1077,7 +1076,7 @@ with tab1:
             df_excesso  = df_view[df_view['Parecer Logístico / Alerta'].isin(
                 ["Estoque Excessivo", "Estoque Parado"]
             )].sort_values('Material')
-            
+
             c0, c1, c2, c3, c4 = st.columns(5)
             c0.metric("📅 Dias Efetivos de Consumo",
                       f"{n_dias_efetivos} dias",
@@ -1100,7 +1099,7 @@ with tab1:
                 st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_excesso), "Overstock"),
                     file_name=f"Overstock_{cod_farmacia_alvo}.xlsx", key="ex_c4", use_container_width=True)
 
-            # ── GRÁFICOS APRIMORADOS ──────────────────────────────────────
+            # ── GRÁFICOS ──────────────────────────────────────
             st.write("")
             g1, g2 = st.columns(2)
 
@@ -1204,10 +1203,13 @@ with tab1:
                 df_filtrado = df_filtrado[df_filtrado['Parecer Logístico / Alerta'].isin(busca_alerta)]
             if busca_cat != "TODAS":
                 df_filtrado = df_filtrado[df_filtrado['Categoria'] == busca_cat]
-                df_exibicao = df_filtrado[ordem_cols].sort_values('Material')
 
+            # Exibir DataFrame com a ordem definida em 'ordem_cols'
+            df_filtrado = df_filtrado.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
+            cols_exibicao = [c for c in ordem_cols if c in df_filtrado.columns]
+            
             st.dataframe(
-                df_filtrado.sort_values('Material'),
+                df_filtrado[cols_exibicao].sort_values('Material'),
                 use_container_width=True, hide_index=True,
                 column_config={
                     "Código MV":               st.column_config.TextColumn("Código MV", width="small"),
@@ -1215,37 +1217,51 @@ with tab1:
                     "Categoria":               st.column_config.TextColumn("Categoria", width="medium"),
                     "Estoque Mínimo":          st.column_config.NumberColumn("Mínimo", format="%d"),
                     "Saldo Atual Satélite":    st.column_config.NumberColumn("Saldo", format="%d"),
-                    "Cobertura (dias)":        st.column_config.TextColumn("Cobertura", width="small"), # Modificado para aceitar Textos
+                    "Cobertura (dias)":        st.column_config.TextColumn("Cobertura", width="small"),
                     "CMD Últ. 3 dias":         st.column_config.NumberColumn("CMD 3 dias", format="%d"),                    
                     "Consumo Médio Diário":    st.column_config.NumberColumn("CMD", format="%d"),
-                    "Necessidade de Ressuprimento": st.column_config.NumberColumn("Necessidade", format="%d"),                    
+                    COL_SUG:                   st.column_config.NumberColumn("Necessidade", format="%d"),                    
                     "Tendência":               st.column_config.TextColumn("Tend.", width="small"),
                     "Δ% Tendência":            st.column_config.TextColumn("Δ%", width="small"),
                     "Saldo Almox. Centrais Unificado": st.column_config.NumberColumn("Saldo Central", format="%d"),
                     "Parecer Logístico / Alerta": st.column_config.TextColumn("Parecer", width="medium"),
+                    "Ação Logística Sugerida":    st.column_config.TextColumn("Ação Sugerida", width="large"),
                 }
             )
 
             # ── DOWNLOADS ─────────────────────────────────────────────────
             st.write("")
-            # df_export usa COL_SUG, ordem_cols e larguras_rel definidos acima
-            df_export = st.session_state['df_final_huufma'].rename(
-                columns={'Necessidade de Ressuprimento': COL_SUG}
-            )[ordem_cols]
+            
+            # DataFrame base de exportação para a Aba Única e Filtro
+            df_export_geral = df_view.rename(columns={'Necessidade de Ressuprimento': COL_SUG})[ordem_cols]
 
             b1, b2, b3 = st.columns(3)
             with b1:
                 st.download_button(
                     "📥 BAIXAR RELATÓRIO COMPLETO — ABA ÚNICA (.XLSX)",
-                    data=exportar_excel_padronizado(df_export, "Painel Geral"),
+                    data=exportar_excel_padronizado(df_export_geral, "Painel Geral"),
                     file_name=f"Painel_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
                     use_container_width=True,
                 )
             with b2:
+                # Ordem e colunas exclusivas para o relatório de abas, conforme solicitado
+                ordem_abas = [
+                    'Código MV', 'Material', 'Categoria', 'Estoque Mínimo', 
+                    'Parecer Logístico / Alerta', 'Saldo Atual Satélite', 'Cobertura (dias)', 
+                    'Δ% Tendência', 'Necessidade de Ressuprimento'
+                ]
+                # Criando df exclusivo para as abas com a renomeação da necessidade
+                df_pedido_abas = df_view.copy()
+                df_pedido_abas = df_pedido_abas.rename(columns={'Necessidade de Ressuprimento': 'PEDIDO (X DIAS)'})
+                
+                # Atualiza a lista da ordem para a coluna renomeada
+                ordem_abas_final = [c if c != 'Necessidade de Ressuprimento' else 'PEDIDO (X DIAS)' for c in ordem_abas]
+                
                 st.download_button(
                     "📥 BAIXAR PEDIDO - CLASSIFICADO POR CATEGORIA (.XLSX)",
                     data=exportar_excel_multi_aba(
-                        df_export, ordem_cols,
+                        df_pedido_abas, # Passa o DF completo para poder filtrar por "Ação Logística" se precisar
+                        ordem_abas_final, # Garante que SÓ essas colunas sairão no arquivo
                         col_categoria='Categoria',
                         col_alerta='Parecer Logístico / Alerta',
                         larguras=larguras_rel,
@@ -1255,9 +1271,7 @@ with tab1:
                     use_container_width=True,
                 )
             with b3:
-                df_filtrado_export = df_filtrado.rename(columns={
-                    'Necessidade de Ressuprimento': COL_SUG
-                })
+                df_filtrado_export = df_filtrado[cols_exibicao]
                 st.download_button(
                     "📥 BAIXAR RESULTADO DA ANÁLISE ATUAL - FILTRADA (.XLSX)",
                     data=exportar_excel_padronizado(df_filtrado_export, "Filtro Atual"),
