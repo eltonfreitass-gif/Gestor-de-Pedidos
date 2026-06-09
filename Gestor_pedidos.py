@@ -141,7 +141,9 @@ def p_num(v) -> float:
         return 0.0
 
 
-def find_col(df: pd.DataFrame, terms: list, forbidden: list = []):
+def find_col(df: pd.DataFrame, terms: list, forbidden: list = None):
+    if forbidden is None:
+        forbidden = []
     for col in df.columns:
         col_clean = clean(col)
         if any(t in col_clean for t in terms) and not any(f in col_clean for f in forbidden):
@@ -164,6 +166,86 @@ def validar_colunas(colunas: dict, contexto: str) -> bool:
 # EXPORTAÇÃO EXCEL
 # =============================================================================
 
+def _col_letter(n: int) -> str:
+    """Converte índice 0-based para letra(s) de coluna Excel (A, B, ..., AA, AB...)."""
+    result = ""
+    while n >= 0:
+        result = chr(n % 26 + ord('A')) + result
+        n = n // 26 - 1
+    return result
+
+
+def _altura_linha(row_values: list, col_widths: list) -> int:
+    """Estima a altura da linha em pontos com base no texto mais longo vs largura da coluna."""
+    max_lines = 1
+    for val, w in zip(row_values, col_widths):
+        texto = str(val) if val is not None and not (isinstance(val, float) and math.isnan(val)) else ""
+        chars_por_linha = max(int(w * 1.1), 8)
+        linhas = math.ceil(len(texto) / chars_por_linha) if texto else 1
+        max_lines = max(max_lines, linhas)
+    return max(18, min(int(max_lines * 14.5), 130))
+
+
+# Larguras padrão por nome amigável de coluna — fonte única usada em ambas as funções
+LARGURAS_PADRAO_EXCEL = {
+    'Código MV': 12, 'Material': 45, 'Categoria': 16,
+    'Saldo Atual Satélite': 20, 'Consumo Médio Diário': 20,
+    'Estoque Mínimo': 16, 'Cobertura (dias)': 14,
+    'CMD Últ. 3 dias': 16, 'Tendência': 12, 'Δ% Tendência': 12,
+    'Saldo Almox. Centrais Unificado': 28, 'Ação Logística Sugerida': 50,
+    'Parecer Logístico / Alerta': 26,
+}
+
+
+def _aplicar_estilo_aba(ws, wb, df: pd.DataFrame, col_alerta: str,
+                         larguras: dict, fmt_h, fmt_b, fmt_t,
+                         fmt_status_cache: dict, fmt_critico) -> None:
+    """Aplica cabeçalho, larguras, altura dinâmica e formatação condicional a uma aba."""
+    # Cabeçalho
+    for ci, cn in enumerate(df.columns):
+        ws.write(0, ci, cn, fmt_h)
+    ws.set_row(0, 40)
+
+    col_widths = []
+    for ci, cn in enumerate(df.columns):
+        larg = larguras.get(cn, 22)
+        fmt_col = fmt_t if cn in ('Material', 'Ação Logística Sugerida') else fmt_b
+        ws.set_column(ci, ci, larg, fmt_col)
+        col_widths.append(larg)
+
+    # Altura dinâmica por linha
+    for ri, row_vals in enumerate(df.itertuples(index=False), start=1):
+        h = _altura_linha(list(row_vals), col_widths)
+        ws.set_row(ri, h)
+
+    ws.freeze_panes(1, 0)
+
+    # Formatação condicional por status
+    if col_alerta in df.columns:
+        idx_al = df.columns.get_loc(col_alerta)
+        letra  = _col_letter(idx_al)
+        n_rows = len(df)
+        n_cols = len(df.columns) - 1
+        for status, (bg, fg) in EXCEL_CORES.items():
+            fmt_c = fmt_status_cache.get(status)
+            if fmt_c is None:
+                fmt_c = wb.add_format({
+                    'bg_color': bg, 'font_color': fg, 'align': 'center',
+                    'valign': 'vcenter', 'text_wrap': True, 'bold': True,
+                    'border': 1, 'border_color': '#D0D0D0', 'font_size': 10
+                })
+                fmt_status_cache[status] = fmt_c
+            ws.conditional_format(1, 0, n_rows, n_cols, {
+                'type': 'formula',
+                'criteria': f'=${letra}2="{status}"',
+                'format': fmt_c
+            })
+        ws.conditional_format(1, 0, n_rows, n_cols, {
+            'type': 'cell', 'operator': 'containing',
+            'value': 'Almoxarifado', 'format': fmt_critico
+        })
+
+
 def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") -> bytes:
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine='xlsxwriter') as wr:
@@ -171,56 +253,23 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
         wb = wr.book
         ws = wr.sheets[nome_aba]
 
-        # Alinhamento vertical centralizado para melhor UX com altura dinâmica
-        fmt_base   = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
-                                    'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-        fmt_texto  = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
-                                    'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-        fmt_header = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter',
-                                    'text_wrap': True, 'bg_color': '#1E3A8A',
-                                    'font_color': '#FFFFFF', 'border': 1, 'font_size': 11})
+        fmt_b = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
+                               'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+        fmt_t = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
+                               'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+        fmt_h = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter',
+                               'text_wrap': True, 'bg_color': '#1E3A8A',
+                               'font_color': '#FFFFFF', 'border': 1, 'font_size': 11})
+        fmt_critico = wb.add_format({'bg_color': '#FCE4D6', 'font_color': '#C65911',
+                                     'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
+                                     'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
 
-        for ci, cn in enumerate(df_dados.columns):
-            ws.write(0, ci, cn, fmt_header)
-        ws.set_row(0, 40)
+        col_alerta = find_col(df_dados, ['parecer', 'alerta', 'status']) or ''
+        larguras   = {**LARGURAS_PADRAO_EXCEL}
 
-        col_mv     = find_col(df_dados, ['codigo', 'mv', 'id']) or df_dados.columns[0]
-        col_mat    = find_col(df_dados, ['material', 'produto', 'descri']) or df_dados.columns[1]
-        col_cat    = find_col(df_dados, ['categoria', 'grupo']) or df_dados.columns[2]
-        col_alerta = find_col(df_dados, ['parecer', 'alerta', 'status'])
-
-        LARGURAS_PAD = {
-            col_mv: 12, col_mat: 45, col_cat: 16,
-            'Saldo Atual Satélite': 20, 'Consumo Médio Diário': 20,
-            'Estoque Mínimo': 16, 'Cobertura (dias)': 14,
-            'CMD Últ. 3 dias': 16, 'Tendência': 12, 'Δ% Tendência': 12,
-            'Saldo Almox. Centrais Unificado': 28, 'Ação Logística Sugerida': 50,
-            'PEDIDO (X DIAS)': 20
-        }
-        for ci, cn in enumerate(df_dados.columns):
-            larg    = LARGURAS_PAD.get(cn, 24)
-            fmt_col = fmt_texto if cn in (col_mat, 'Ação Logística Sugerida') else fmt_base
-            ws.set_column(ci, ci, larg, fmt_col)
-
-        # Sem trava de altura para permitir autoajuste do Excel
-        total_linhas = len(df_dados)
-        ws.freeze_panes(1, 0)
-
-        if col_alerta:
-            idx_al  = df_dados.columns.get_loc(col_alerta)
-            letra   = chr(ord('A') + idx_al)
-            n_cols  = len(df_dados.columns) - 1
-            for status, (bg, fg) in EXCEL_CORES.items():
-                fmt_c = wb.add_format({'bg_color': bg, 'font_color': fg, 'align': 'center',
-                                       'valign': 'vcenter', 'text_wrap': True, 'bold': True,
-                                       'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-                ws.conditional_format(1, 0, total_linhas, n_cols,
-                    {'type': 'formula', 'criteria': f'=${letra}2="{status}"', 'format': fmt_c})
-            fmt_critico = wb.add_format({'bg_color': '#FCE4D6', 'font_color': '#C65911',
-                                         'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
-                                         'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-            ws.conditional_format(1, 0, total_linhas, n_cols,
-                {'type': 'cell', 'operator': 'containing', 'value': 'Almoxarifado', 'format': fmt_critico})
+        fmt_status_cache: dict = {}
+        _aplicar_estilo_aba(ws, wb, df_dados, col_alerta, larguras,
+                            fmt_h, fmt_b, fmt_t, fmt_status_cache, fmt_critico)
     return buf.getvalue()
 
 
@@ -231,24 +280,28 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
     excluir_acoes = excluir_acoes or []
 
     with pd.ExcelWriter(buf, engine='xlsxwriter') as writer:
-        wb     = writer.book
-        # Alinhamento vertical centralizado
-        fmt_b  = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
-                                 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-        fmt_t  = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
-                                 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-        fmt_h  = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter',
-                                 'text_wrap': True, 'bg_color': '#1E3A8A',
-                                 'font_color': '#FFFFFF', 'border': 1, 'font_size': 11})
+        wb = writer.book
+
+        # Formatos criados UMA única vez fora do loop de abas
+        fmt_b = wb.add_format({'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
+                               'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+        fmt_t = wb.add_format({'align': 'left',   'valign': 'vcenter', 'text_wrap': True,
+                               'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+        fmt_h = wb.add_format({'bold': True, 'align': 'center', 'valign': 'vcenter',
+                               'text_wrap': True, 'bg_color': '#1E3A8A',
+                               'font_color': '#FFFFFF', 'border': 1, 'font_size': 11})
         fmt_critico = wb.add_format({'bg_color': '#FCE4D6', 'font_color': '#C65911',
-                                      'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
-                                      'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+                                     'align': 'center', 'valign': 'vcenter', 'text_wrap': True,
+                                     'bold': True, 'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
+
+        # Cache de formatos por status — criado uma vez, reutilizado em todas as abas
+        fmt_status_cache: dict = {}
 
         for cat, df_cat in df_total.groupby(col_categoria):
             df_exp = df_cat.copy()
             if excluir_acoes and 'Ação Logística Sugerida' in df_exp.columns:
                 df_exp = df_exp[~df_exp['Ação Logística Sugerida'].isin(excluir_acoes)]
-                
+
             cols_ok = [c for c in ordem_cols if c in df_exp.columns]
             df_exp  = df_exp[cols_ok].sort_values('Material').copy()
             if df_exp.empty:
@@ -258,31 +311,8 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
             df_exp.to_excel(writer, sheet_name=nome_aba, index=False)
             ws = writer.sheets[nome_aba]
 
-            for ci, cn in enumerate(df_exp.columns):
-                ws.write(0, ci, cn, fmt_h)
-            ws.set_row(0, 40)
-
-            for ci, cn in enumerate(df_exp.columns):
-                larg    = larguras.get(cn, 20)
-                fmt_col = fmt_t if cn in ('Material', 'Ação Logística Sugerida') else fmt_b
-                ws.set_column(ci, ci, larg, fmt_col)
-
-            total_l = len(df_exp)
-            ws.freeze_panes(1, 0)
-
-            if col_alerta in df_exp.columns:
-                idx_al = df_exp.columns.get_loc(col_alerta)
-                letra  = chr(ord('A') + idx_al)
-                n_cols = len(df_exp.columns) - 1
-                for status, (bg, fg) in EXCEL_CORES.items():
-                    fmt_c = wb.add_format({'bg_color': bg, 'font_color': fg, 'align': 'center',
-                                           'valign': 'vcenter', 'text_wrap': True, 'bold': True,
-                                           'border': 1, 'border_color': '#D0D0D0', 'font_size': 10})
-                    ws.conditional_format(1, 0, total_l, n_cols,
-                        {'type': 'formula', 'criteria': f'=${letra}2="{status}"', 'format': fmt_c})
-                ws.conditional_format(1, 0, total_l, n_cols,
-                    {'type': 'cell', 'operator': 'containing',
-                     'value': 'Almoxarifado', 'format': fmt_critico})
+            _aplicar_estilo_aba(ws, wb, df_exp, col_alerta, larguras,
+                                fmt_h, fmt_b, fmt_t, fmt_status_cache, fmt_critico)
     return buf.getvalue()
 
 
@@ -750,6 +780,8 @@ with tab1:
             progress = st.progress(0, text="📂 Lendo arquivos...")
 
             try:
+                file_mov_alvo.seek(0)
+                file_est_geral.seek(0)
                 mov       = ler_csv_cached(file_mov_alvo.read(), file_mov_alvo.name)
                 est_geral = ler_csv_cached(file_est_geral.read(), file_est_geral.name)
 
@@ -845,8 +877,8 @@ with tab1:
                 progress.progress(40, text="📊 Calculando consumo e auditando calendário...")
 
                 mov = mov.copy()
-                # Correção do dayfirst=True
-                mov['dt_formatada'] = pd.to_datetime(mov[c_mov_data], errors='coerce')
+                # Formato AGHUx: AAAA-MM-DD HH:MM — dayfirst=False (padrão ISO)
+                mov['dt_formatada'] = pd.to_datetime(mov[c_mov_data], dayfirst=False, errors='coerce')
                 mov_filtrado = mov[
                     (mov['dt_formatada'].dt.date >= data_inicio) &
                     (mov['dt_formatada'].dt.date <= data_fim) &
@@ -891,6 +923,7 @@ with tab1:
                 if files_mov_parceiras:
                     for f_parc in files_mov_parceiras:
                         try:
+                            f_parc.seek(0)
                             df_p = ler_csv_cached(f_parc.read(), f_parc.name)
                             c_p_cod   = find_col(df_p, ['material', 'cod', 'ca3'])
                             c_p_qtd   = find_col(df_p, ['quant'])
@@ -903,9 +936,9 @@ with tab1:
                                 continue
 
                             df_p = df_p.copy()
-                            # Correção do dayfirst=True
+                            # Formato AGHUx: AAAA-MM-DD HH:MM — dayfirst=False (padrão ISO)
                             df_p['dt_formatada'] = pd.to_datetime(
-                                df_p[c_p_data], errors='coerce'
+                                df_p[c_p_data], dayfirst=False, errors='coerce'
                             )
                             df_p_filt = df_p[
                                 (df_p['dt_formatada'].dt.date >= data_inicio) &
@@ -1058,7 +1091,8 @@ with tab1:
                 'Código MV': 12, 'Material': 45, 'Categoria': 16,
                 'Estoque Mínimo': 16, 'Saldo Atual Satélite': 18,
                 'Cobertura (dias)': 14, 'CMD Últ. 3 dias': 16,
-                'Consumo Médio Diário': 18, COL_SUG: 26, 'PEDIDO (X DIAS)': 20,
+                'Consumo Médio Diário': 18, COL_SUG: 26,
+                f'PEDIDO ({dias_pedido} DIAS)': 20,
                 'Tendência': 10, 'Δ% Tendência': 12,
                 'Saldo Almox. Centrais Unificado': 28,
                 'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
@@ -1252,10 +1286,11 @@ with tab1:
                 ]
                 # Criando df exclusivo para as abas com a renomeação da necessidade
                 df_pedido_abas = df_view.copy()
-                df_pedido_abas = df_pedido_abas.rename(columns={'Necessidade de Ressuprimento': 'PEDIDO (X DIAS)'})
+                col_pedido_label = f'PEDIDO ({dias_pedido} DIAS)'
+                df_pedido_abas = df_pedido_abas.rename(columns={'Necessidade de Ressuprimento': col_pedido_label})
                 
                 # Atualiza a lista da ordem para a coluna renomeada
-                ordem_abas_final = [c if c != 'Necessidade de Ressuprimento' else 'PEDIDO (X DIAS)' for c in ordem_abas]
+                ordem_abas_final = [c if c != 'Necessidade de Ressuprimento' else col_pedido_label for c in ordem_abas]
                 
                 st.download_button(
                     "📥 BAIXAR PEDIDO - CLASSIFICADO POR CATEGORIA (.XLSX)",
