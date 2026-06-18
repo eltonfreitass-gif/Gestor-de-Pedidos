@@ -4,3 +4,4 @@ altair>=5.0.0
 xlsxwriter>=3.1.0
 openpyxl>=3.1.0
 st-gsheets-connection
+Office365-REST-Python-Client
