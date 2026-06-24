@@ -806,6 +806,56 @@ def preparar_painel_validades(
     return df.sort_values(['_ord', 'Dias até Vencer']).drop(columns='_ord')
 
 
+def processar_validades_para_sessao(df_sp_raw: pd.DataFrame, origem: str = "Planilha de validade") -> tuple[bool, str]:
+    """Normaliza, mescla e salva as validades no session_state.
+
+    Mantém a lógica já validada do app, mas centraliza o carregamento para que
+    a Central de Processamento possa alimentar o painel de validade, o pedido e
+    os remanejamentos FEFO no mesmo fluxo operacional.
+    """
+    if df_sp_raw is None or df_sp_raw.empty:
+        return False, "A fonte de validade está vazia."
+
+    df_sp_norm = normalizar_planilha_validades(df_sp_raw)
+    if df_sp_norm.empty:
+        return False, (
+            "A planilha de validades não pôde ser interpretada. "
+            "Verifique se há colunas identificáveis de Código MV e Validade."
+        )
+
+    df_aghu_val = pd.DataFrame()
+    if 'est_geral_raw' in st.session_state:
+        df_aghu_val = extrair_validades_aghu(st.session_state['est_geral_raw'])
+
+    df_val_final = mesclar_validades(df_aghu_val, df_sp_norm)
+    mapa_cat_val = obter_mapa_categorias()
+    est_geral_para_saldo = st.session_state.get('est_geral_raw')
+    painel_validades = preparar_painel_validades(
+        df_val_final, mapa_cat_val, est_geral_para_saldo
+    )
+
+    st.session_state['df_validades_mescladas'] = painel_validades
+    st.session_state['validade_ultima_origem'] = origem
+    st.session_state['validade_ultima_carga'] = datetime.now().strftime('%d/%m/%Y %H:%M')
+
+    n_aghu = len(df_aghu_val)
+    n_sp = len(df_sp_norm)
+    n_painel = len(painel_validades)
+    tem_estoque_aghu = (
+        est_geral_para_saldo is not None and
+        isinstance(est_geral_para_saldo, pd.DataFrame) and
+        not est_geral_para_saldo.empty
+    )
+    complemento = (
+        f" Após filtro por Saldo AGHU > 0, permanecem {n_painel} registros no painel."
+        if tem_estoque_aghu else
+        f" {n_painel} registros foram mantidos no painel provisório, sem filtro por AGHU."
+    )
+    return True, (
+        f"Validades carregadas de {origem}: {n_aghu} registros extraídos do AGHU + "
+        f"{n_sp} registros da planilha da equipe → {len(df_val_final)} registros candidatos."
+        + complemento
+    )
 
 
 def calcular_remanejamento_preventivo_validade(
@@ -995,9 +1045,352 @@ def calcular_remanejamento_preventivo_validade(
     ).reset_index(drop=True)
 
 
-# =============================================================================
-# CONSOLIDAÇÃO MULTI-FARMÁCIA — FUNÇÕES
-# =============================================================================
+def _cobertura_texto(saldo, cmd) -> str:
+    """Formata cobertura em dias de forma segura para relatórios gerenciais."""
+    try:
+        saldo = float(saldo)
+    except Exception:
+        saldo = 0.0
+    try:
+        cmd = float(cmd)
+    except Exception:
+        cmd = 0.0
+    if cmd <= 0:
+        return "+∞" if saldo > 0 else "Sem consumo"
+    dias = saldo / cmd
+    if not np.isfinite(dias):
+        return "Sem dado"
+    return f"{dias:.1f} dia(s)"
+
+
+def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
+                                      df_validades: pd.DataFrame | None = None,
+                                      dias_cobertura: int | None = None) -> pd.DataFrame:
+    """Sugere remanejamentos gerais apenas em cenário de contingência real.
+
+    Esta análise NÃO equaliza todos os estoques indiscriminadamente. Ela só entra
+    quando há, para o mesmo Código MV:
+      1) pelo menos uma farmácia com consumo real e necessidade por consumo;
+      2) saldo dos almoxarifados fornecedores zerado ou insuficiente para cobrir
+         a necessidade agregada calculada por consumo, sem usar estoque mínimo;
+      3) saldo disponível em outra farmácia satélite.
+
+    Quando esses gatilhos são atendidos, o saldo existente nas farmácias é
+    redistribuído de forma proporcional ao CMD, buscando que as farmácias
+    consumidoras fiquem com coberturas semelhantes. Farmácias sem consumo
+    recente têm estoque-alvo zero e podem doar todo o saldo.
+    """
+    if df_cons is None or df_cons.empty:
+        return pd.DataFrame()
+
+    obrig = {'Código MV', 'Material', 'Categoria', 'Farmácia', 'Cód. Farmácia', 'Saldo Atual', 'CMD'}
+    if not obrig.issubset(df_cons.columns):
+        return pd.DataFrame()
+
+    try:
+        dias_cobertura = int(dias_cobertura or 15)
+    except Exception:
+        dias_cobertura = 15
+    dias_cobertura = max(dias_cobertura, 1)
+
+    df = df_cons.copy()
+    df['key'] = df['Código MV'].apply(clean_key)
+    df['cod_farm'] = df['Cód. Farmácia'].apply(clean_key)
+    df['Saldo Atual'] = (
+        pd.to_numeric(df['Saldo Atual'], errors='coerce')
+        .replace([np.inf, -np.inf], 0).fillna(0).clip(lower=0)
+    )
+    df['CMD'] = (
+        pd.to_numeric(df['CMD'], errors='coerce')
+        .replace([np.inf, -np.inf], 0).fillna(0).clip(lower=0)
+    )
+    if 'Parecer' not in df.columns:
+        df['Parecer'] = ''
+    if 'Saldo Central' not in df.columns:
+        df['Saldo Central'] = 0
+
+    df['Saldo Central'] = (
+        pd.to_numeric(df['Saldo Central'], errors='coerce')
+        .replace([np.inf, -np.inf], 0).fillna(0).clip(lower=0)
+    )
+
+    # Necessidade REAL para esta análise: baseada apenas no consumo médio diário
+    # e no período de cobertura desejado. Não usa estoque mínimo, para evitar
+    # sugerir remanejamento para farmácia sem demanda real.
+    df['Necessidade consumo real'] = np.where(
+        df['CMD'] > 0,
+        np.ceil(np.maximum((df['CMD'] * dias_cobertura) - df['Saldo Atual'], 0)),
+        0
+    )
+    df['Necessidade consumo real'] = (
+        pd.to_numeric(df['Necessidade consumo real'], errors='coerce')
+        .replace([np.inf, -np.inf], 0).fillna(0).clip(lower=0).astype(int)
+    )
+
+    # Consolidar eventual duplicidade por item+farmácia antes de calcular a distribuição.
+    df = (df.groupby(['key', 'cod_farm'], as_index=False)
+            .agg({
+                'Código MV': 'first',
+                'Material': 'first',
+                'Categoria': 'first',
+                'Farmácia': 'first',
+                'Saldo Atual': 'sum',
+                'CMD': 'max',
+                'Necessidade consumo real': 'max',
+                'Parecer': 'first',
+                'Saldo Central': 'max',
+            }))
+
+    # Chaves com alerta de validade para observação, sem excluir automaticamente da análise geral.
+    chaves_validade = set()
+    if df_validades is not None and not df_validades.empty:
+        dfv = df_validades.copy()
+        if {'key', 'Farmácia'}.issubset(dfv.columns):
+            dfv['key'] = dfv['key'].apply(clean_key)
+            dfv['Farmácia'] = dfv['Farmácia'].apply(clean_key)
+            if 'Dias até Vencer' in dfv.columns:
+                dias = pd.to_numeric(dfv['Dias até Vencer'], errors='coerce')
+                mask = dias.between(0, VALIDADE_ATENCAO_DIAS, inclusive='both')
+            else:
+                mask = pd.Series(True, index=dfv.index)
+            if 'Saldo AGHU' in dfv.columns:
+                saldo_v = pd.to_numeric(dfv['Saldo AGHU'], errors='coerce').fillna(0)
+                mask = mask & (saldo_v > 0)
+            chaves_validade = set(zip(dfv.loc[mask, 'key'], dfv.loc[mask, 'Farmácia']))
+
+    def _prioridade_parecer(parecer: str) -> int:
+        p = str(parecer)
+        if 'Desabastecimento Crítico' in p:
+            return 0
+        if 'Remanejar' in p:
+            return 1
+        if 'Almoxarifado' in p or 'Estoque Crítico CAF' in p:
+            return 2
+        if 'Solicitar' in p:
+            return 3
+        return 4
+
+    resultados = []
+
+    for cod, g in df.groupby('key'):
+        g = g.copy().reset_index(drop=True)
+        if cod == '' or g.empty:
+            continue
+
+        # Gatilho 1: precisa haver demanda real em pelo menos uma farmácia consumidora.
+        # A necessidade não usa estoque mínimo; usa apenas CMD x dias_cobertura.
+        g['precisa_receber'] = (g['CMD'] > 0) & (g['Necessidade consumo real'] > 0)
+        if not g['precisa_receber'].any():
+            continue
+
+        necessidade_total = int(math.ceil(float(g.loc[g['precisa_receber'], 'Necessidade consumo real'].sum())))
+        if necessidade_total <= 0:
+            continue
+
+        saldo_central = int(round(float(g['Saldo Central'].max())))
+        central_insuficiente = saldo_central < necessidade_total
+
+        # Gatilho 2: se os almoxarifados conseguem atender a necessidade agregada real,
+        # a ação logística preferencial continua sendo solicitar ao almoxarifado.
+        if not central_insuficiente:
+            continue
+
+        saldo_total_farmacias = int(round(float(g['Saldo Atual'].sum())))
+        cmd_total_consumidoras = float(g.loc[g['CMD'] > 0, 'CMD'].sum())
+
+        # Sem estoque nas farmácias ou sem consumo recente não há redistribuição segura.
+        if saldo_total_farmacias <= 0 or cmd_total_consumidoras <= 0:
+            continue
+
+        # Gatilho 3: precisa existir saldo disponível em alguma farmácia satélite.
+        if not (g['Saldo Atual'] > 0).any():
+            continue
+
+        cobertura_alvo = saldo_total_farmacias / cmd_total_consumidoras
+        if not np.isfinite(cobertura_alvo) or cobertura_alvo <= 0:
+            continue
+
+        # Estoque ideal inteiro preservando o saldo total: floor + distribuição por maior fração.
+        # Farmácias com CMD=0 ficam com alvo zero. Farmácias com consumo entram na conta para
+        # preservar a assistência, mesmo se naquele momento não estão abaixo do parâmetro de pedido.
+        g['ideal_raw'] = np.where(g['CMD'] > 0, g['CMD'] * cobertura_alvo, 0.0)
+        g['ideal_floor'] = np.floor(g['ideal_raw']).astype(int)
+        g.loc[g['CMD'] <= 0, 'ideal_floor'] = 0
+        g['frac'] = g['ideal_raw'] - np.floor(g['ideal_raw'])
+
+        restante = int(saldo_total_farmacias - g['ideal_floor'].sum())
+        g['estoque_ideal'] = g['ideal_floor'].astype(int)
+        if restante > 0:
+            idx_consumo = g[g['CMD'] > 0].sort_values('frac', ascending=False).index.tolist()
+            if idx_consumo:
+                for idx in idx_consumo[:restante]:
+                    g.loc[idx, 'estoque_ideal'] += 1
+
+        g['saldo_int'] = g['Saldo Atual'].round().astype(int).clip(lower=0)
+        g['delta'] = g['estoque_ideal'] - g['saldo_int']
+        g['cobertura_atual_num'] = np.where(g['CMD'] > 0, g['Saldo Atual'] / g['CMD'], np.inf)
+
+        donors = []
+        receivers = []
+        for _, r in g.iterrows():
+            saldo = int(r['saldo_int'])
+            cmd = float(r['CMD'])
+            delta = int(round(float(r['delta'])))
+            cobertura_atual = float(r['cobertura_atual_num']) if np.isfinite(r['cobertura_atual_num']) else np.inf
+
+            item = {
+                'cod_farm': r['cod_farm'],
+                'farmacia': r['Farmácia'],
+                'saldo': saldo,
+                'cmd': cmd,
+                'parecer': r.get('Parecer', ''),
+                'necessidade_consumo_real': int(r.get('Necessidade consumo real', 0) or 0),
+                'precisa_receber': bool(r.get('precisa_receber', False)),
+                'cobertura_atual': cobertura_atual,
+                'estoque_ideal': int(round(float(r['estoque_ideal']))),
+            }
+
+            # Receptores: farmácias consumidoras abaixo do estoque ideal após redistribuição.
+            # O gatilho do item já exige que exista necessidade real em pelo menos uma farmácia.
+            if cmd > 0 and delta > 0:
+                item['necessidade_equalizar'] = int(delta)
+                receivers.append(item)
+
+            # Doadoras: farmácia sem consumo doa todo o saldo; farmácia com consumo doa
+            # apenas o excedente acima do estoque ideal.
+            if saldo > 0:
+                if cmd <= 0:
+                    excedente = saldo
+                else:
+                    excedente = max(0, saldo - int(item['estoque_ideal']))
+                if excedente > 0:
+                    item['excedente'] = int(excedente)
+                    donors.append(item)
+
+        if not donors or not receivers:
+            continue
+
+        donors.sort(key=lambda d: (0 if d['cmd'] <= 0 else 1, -d['cobertura_atual'], -d['excedente']))
+        receivers.sort(key=lambda d: (_prioridade_parecer(d['parecer']), d['cobertura_atual'], -d['necessidade_equalizar']))
+
+        for rec in receivers:
+            necessidade_restante = int(rec['necessidade_equalizar'])
+            saldo_destino_corrente = int(rec['saldo'])
+            if necessidade_restante <= 0:
+                continue
+
+            for donor in donors:
+                if necessidade_restante <= 0:
+                    break
+                if donor['cod_farm'] == rec['cod_farm']:
+                    continue
+                excedente_disponivel = int(donor.get('excedente', 0))
+                if excedente_disponivel <= 0:
+                    continue
+
+                qtd = int(min(excedente_disponivel, necessidade_restante))
+                if qtd <= 0:
+                    continue
+
+                cobertura_destino_antes_num = (saldo_destino_corrente / rec['cmd']) if rec['cmd'] > 0 else np.nan
+                cobertura_destino_apos = (saldo_destino_corrente + qtd) / rec['cmd'] if rec['cmd'] > 0 else np.nan
+                obs_validade = ''
+                if (cod, donor['cod_farm']) in chaves_validade:
+                    obs_validade = 'Origem também possui alerta de validade; avaliar prioridade FEFO.'
+                elif (cod, rec['cod_farm']) in chaves_validade:
+                    obs_validade = 'Destino possui alerta de validade para este item; avaliar antes de transferir.'
+
+                if donor['cmd'] <= 0:
+                    motivo_origem = 'a origem não apresentou consumo recente e pode doar o saldo disponível'
+                else:
+                    motivo_origem = (
+                        f'a origem preserva estoque proporcional ao seu consumo, mantendo alvo aproximado de '
+                        f'{donor["estoque_ideal"]} un.'
+                    )
+
+                cobertura_origem_txt = _cobertura_texto(donor['saldo'], donor['cmd'])
+                cobertura_destino_txt = _cobertura_texto(saldo_destino_corrente, rec['cmd'])
+                justificativa = (
+                    f"Almoxarifados fornecedores com saldo insuficiente ({saldo_central} un. para "
+                    f"{necessidade_total} un. de necessidade real por consumo em {dias_cobertura} dia(s)). "
+                    f"Origem: {donor['farmacia']} possui {donor['saldo']} un., CMD {donor['cmd']:.2f} un./dia, "
+                    f"cobertura {cobertura_origem_txt} e excedente remanejável de {excedente_disponivel} un.; "
+                    f"{motivo_origem}. Destino: {rec['farmacia']} possui {saldo_destino_corrente} un., "
+                    f"CMD {rec['cmd']:.2f} un./dia, cobertura {cobertura_destino_txt} e necessidade para equalizar "
+                    f"{necessidade_restante} un. Sugere-se transferir {qtd} un. para estimar cobertura de "
+                    f"{cobertura_destino_apos:.1f} dia(s), aproximando-se da cobertura hospitalar alvo de "
+                    f"{cobertura_alvo:.1f} dia(s)."
+                )
+                if obs_validade:
+                    justificativa += f" {obs_validade}"
+
+                resultados.append({
+                    'Código MV': str(g['Código MV'].iloc[0]),
+                    'Material': str(g['Material'].iloc[0]),
+                    'Categoria': str(g['Categoria'].iloc[0]),
+                    'Saldo almoxarifados fornecedores': saldo_central,
+                    'Necessidade agregada das farmácias': necessidade_total,
+                    'Transferir DE': donor['farmacia'],
+                    'Saldo origem': donor['saldo'],
+                    'CMD origem': donor['cmd'],
+                    'Cobertura origem antes': cobertura_origem_txt,
+                    'Excedente disponível': excedente_disponivel,
+                    'Transferir PARA': rec['farmacia'],
+                    'Saldo destino': saldo_destino_corrente,
+                    'CMD destino': rec['cmd'],
+                    'Cobertura destino antes': cobertura_destino_txt,
+                    'Necessidade para equalizar': necessidade_restante,
+                    'Quantidade sugerida remanejar': qtd,
+                    'Cobertura alvo hospitalar': f"{cobertura_alvo:.1f} dia(s)",
+                    'Cobertura estimada destino após remanejamento': f"{cobertura_destino_apos:.1f} dia(s)",
+                    'Observação validade': obs_validade,
+                    'Justificativa': justificativa,
+                })
+
+                donor['excedente'] -= qtd
+                necessidade_restante -= qtd
+                saldo_destino_corrente += qtd
+
+    if not resultados:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(resultados)
+    col_int = [
+        'Saldo almoxarifados fornecedores', 'Necessidade agregada das farmácias',
+        'Saldo origem', 'Excedente disponível', 'Saldo destino',
+        'Necessidade para equalizar', 'Quantidade sugerida remanejar'
+    ]
+    for c in col_int:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors='coerce').replace([np.inf, -np.inf], 0).fillna(0).astype(int)
+    for c in ['CMD origem', 'CMD destino']:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors='coerce').replace([np.inf, -np.inf], 0).fillna(0).round(2)
+
+    out = out[out['Quantidade sugerida remanejar'] > 0].copy()
+    if out.empty:
+        return pd.DataFrame()
+
+    ordem_cols = [
+        'Código MV', 'Material', 'Categoria',
+        'Saldo almoxarifados fornecedores', 'Necessidade agregada das farmácias',
+        'Transferir DE', 'Saldo origem', 'CMD origem', 'Cobertura origem antes', 'Excedente disponível',
+        'Transferir PARA', 'Saldo destino', 'CMD destino', 'Cobertura destino antes',
+        'Necessidade para equalizar', 'Quantidade sugerida remanejar',
+        'Cobertura alvo hospitalar', 'Cobertura estimada destino após remanejamento',
+        'Observação validade', 'Justificativa'
+    ]
+    for c in ordem_cols:
+        if c not in out.columns:
+            out[c] = ''
+
+    # Ordenação padrão de abertura: Material em ordem alfabética.
+    # Mantém a leitura operacional mais intuitiva e facilita localizar o item.
+    return out[ordem_cols].sort_values(
+        ['Material', 'Código MV', 'Transferir DE', 'Transferir PARA'],
+        ascending=[True, True, True, True],
+        kind='mergesort'
+    ).reset_index(drop=True)
 
 def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
                               cod_farm: str, mapa_cat: dict,
@@ -1363,6 +1756,375 @@ def definir_alerta_e_acao(
     )
 
 
+
+
+# =============================================================================
+# RENDERIZAÇÃO — PEDIDO DA FARMÁCIA ATIVA
+# =============================================================================
+def render_painel_pedido_completo() -> None:
+    """Exibe a análise completa do pedido da farmácia ativa.
+
+    A Central de Processamento deve ficar apenas com upload/processamento.
+    Toda a leitura operacional do resultado fica concentrada nesta função,
+    chamada na aba 📦 Pedido da Farmácia Ativa.
+    """
+    # =================================================================
+    # PAINEL DE RESULTADOS
+    # =================================================================
+    if 'df_final_huufma' in st.session_state:
+        df_view         = st.session_state['df_final_huufma'].copy()
+        n_dias_efetivos = st.session_state.get('n_dias_efetivos_huufma', '—')
+        datas_vazias    = st.session_state.get('datas_sem_movimento_huufma', [])
+        cod_farmacia_alvo = st.session_state.get('cod_farmacia_alvo', 'Alvo')
+
+        if datas_vazias:
+            st.warning(
+                f"⚠️ **Auditoria de Calendário:** Sem movimentação em "
+                f"`{len(datas_vazias)}` dia(s) do período: "
+                f"`{', '.join(datas_vazias)}`. "
+                f"O CMD foi calculado com **{n_dias_efetivos} dias efetivos** de movimento."
+            )
+        else:
+            st.info(
+                f"✅ **Calendário completo:** Todos os dias do período tiveram movimento. "
+                f"CMD calculado com **{n_dias_efetivos} dias efetivos**."
+            )
+
+        # ── BADGE RESUMO DE VALIDADES (itens deste pedido com validade crítica) ──
+        if '⏰ Validade' in df_view.columns:
+            n_venc_pedido = df_view['⏰ Validade'].str.contains('VENCIDO', na=False).sum()
+            n_crit_pedido = df_view['⏰ Validade'].str.contains('Crítico', na=False).sum()
+            if n_venc_pedido > 0 or n_crit_pedido > 0:
+                partes = []
+                if n_venc_pedido > 0:
+                    partes.append(f"**{n_venc_pedido}** vencido(s)")
+                if n_crit_pedido > 0:
+                    partes.append(f"**{n_crit_pedido}** crítico(s) (≤30 dias)")
+                st.error(
+                    f"⏰ **Atenção às validades:** {' e '.join(partes)} entre os itens desta análise. "
+                    f"Veja a coluna **⏰ Validade** na tabela abaixo ou confira o detalhe completo na "
+                    f"aba **Controle de Validade**."
+                )
+            elif 'df_validades_mescladas' in st.session_state:
+                st.success("⏰ **Validades:** nenhum item desta farmácia está vencido ou em estado crítico.")
+
+        st.write("---")
+
+        diag = st.session_state.get('diagnostico_categorias', {})
+        if diag:
+            pct = round(diag['mapeados'] / max(diag['total'], 1) * 100, 1)
+            if diag['outros'] > 0:
+                st.warning(
+                    f"🏷️ **Cobertura de Categorias:** {diag['mapeados']} de {diag['total']} itens "
+                    f"classificados ({pct}%). **{diag['outros']} item(ns) como 'OUTROS'.**"
+                )
+            else:
+                st.success(
+                    f"🏷️ **Categorias:** 100% dos {diag['total']} itens classificados."
+                )
+
+        # ── DEFINIÇÃO DAS VARIÁVEIS DE ORDEM PARA TODOS OS DOWNLOADS E PAINEL ──
+        COL_SUG = f'Necessidade de Ressuprimento ({dias_pedido} dias)'
+        ordem_cols = [
+            'Código MV', 'Material', 'Categoria',
+            'Estoque Mínimo', 'Saldo Atual Satélite', 'Cobertura (dias)',
+            'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG,
+            'Tendência', 'Δ% Tendência', '⏰ Validade',
+            'Saldo Almox. Centrais Unificado',
+            'Parecer Logístico / Alerta', 'Ação Logística Sugerida',
+        ]
+        larguras_rel = {
+            'Código MV': 12, 'Material': 45, 'Categoria': 16,
+            'Estoque Mínimo': 16, 'Saldo Atual Satélite': 18,
+            'Cobertura (dias)': 14, 'CMD Últ. 3 dias': 16,
+            'Consumo Médio Diário': 18, COL_SUG: 26,
+            f'PEDIDO ({dias_pedido} DIAS)': 20,
+            'Tendência': 10, 'Δ% Tendência': 12, '⏰ Validade': 18,
+            'Saldo Almox. Centrais Unificado': 28,
+            'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
+        }
+
+        def _preparar_df_card(df_raw: pd.DataFrame) -> pd.DataFrame:
+            df = df_raw.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
+            cols_ok = [c for c in ordem_cols if c in df.columns]
+            return df[cols_ok]
+
+        # ── MÉTRICAS ─────────────────────────────────────────────────
+        df_desabast = df_view[df_view['Parecer Logístico / Alerta'] == "Desabastecimento Crítico"].sort_values('Material')
+        df_remanej  = df_view[df_view['Parecer Logístico / Alerta'] == "Remanejar"].sort_values('Material')
+        df_caf      = df_view[df_view['Parecer Logístico / Alerta'].str.contains("Solicitar|Almoxarifado", na=False)].sort_values('Material')
+        df_excesso  = df_view[df_view['Parecer Logístico / Alerta'].isin(
+            ["Estoque Excessivo", "Estoque Parado"]
+        )].sort_values('Material')
+
+        c0, c1, c2, c3, c4 = st.columns(5)
+        c0.metric("📅 Dias Efetivos de Consumo",
+                  f"{n_dias_efetivos} dias",
+                  delta=f"-{len(datas_vazias)} sem mov." if datas_vazias else "Período completo",
+                  delta_color="inverse" if datas_vazias else "normal")
+        with c1:
+            st.metric("🚨 Desabastecimento Crítico", f"{len(df_desabast)} itens")
+            st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_desabast), "Rupturas"),
+                file_name=f"Rupturas_{cod_farmacia_alvo}.xlsx", key="ex_c1", use_container_width=True)
+        with c2:
+            st.metric("🔄 Remanejamento Potencial", f"{len(df_remanej)} itens")
+            st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_remanej), "Remanejamento"),
+                file_name=f"Remanejamento_{cod_farmacia_alvo}.xlsx", key="ex_c2", use_container_width=True)
+        with c3:
+            st.metric("📦 Disponível no Almoxarifado", f"{len(df_caf)} itens")
+            st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_caf), "Disponiveis_CAF"),
+                file_name=f"Disponiveis_{cod_farmacia_alvo}.xlsx", key="ex_c3", use_container_width=True)
+        with c4:
+            st.metric("⚠️ Excesso / Sem Giro", f"{len(df_excesso)} itens")
+            st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_excesso), "Overstock"),
+                file_name=f"Overstock_{cod_farmacia_alvo}.xlsx", key="ex_c4", use_container_width=True)
+
+        # ── GRÁFICOS ──────────────────────────────────────
+        st.write("")
+        g1, g2 = st.columns(2)
+
+        with g1:
+            st.markdown("**Saúde Geral do Estoque**")
+            df_g1 = df_view.copy()
+            df_g1.loc[
+                df_g1['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False),
+                'Parecer Logístico / Alerta'
+            ] = "Estoque Crítico CAF"
+            df_g1_grp = (
+                df_g1[df_g1['Parecer Logístico / Alerta'] != 'Sem Consumo']
+                .groupby('Parecer Logístico / Alerta')['Código MV'].count()
+                .reset_index()
+                .rename(columns={'Código MV': 'Quantidade', 'Parecer Logístico / Alerta': 'Status'})
+            )
+            if not df_g1_grp.empty:
+                st.altair_chart(
+                    alt.Chart(df_g1_grp).mark_arc(innerRadius=65, stroke='#fff').encode(
+                        theta=alt.Theta('Quantidade:Q'),
+                        color=alt.Color('Status:N', scale=alt.Scale(
+                            domain=list(MAPA_CORES_GRAFICO.keys()),
+                            range=list(MAPA_CORES_GRAFICO.values())
+                        ), legend=None),
+                        tooltip=['Status:N', 'Quantidade:Q']
+                    ).properties(height=350),
+                    use_container_width=True
+                )
+
+        with g2:
+            st.markdown("**Matriz de Urgência por Categoria**")
+            df_g2 = df_view[df_view['Categoria'] != 'OUTROS'].copy()
+            df_g2.loc[
+                df_g2['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False),
+                'Parecer Logístico / Alerta'
+            ] = "Estoque Crítico CAF"
+            
+            df_g2_grp = (
+                df_g2[df_g2['Parecer Logístico / Alerta'] != 'Sem Consumo']
+                .groupby(['Categoria', 'Parecer Logístico / Alerta'])['Código MV'].count()
+                .reset_index()
+                .rename(columns={'Código MV': 'Itens', 'Parecer Logístico / Alerta': 'Parecer'})
+            )
+            
+            if not df_g2_grp.empty:
+                base = alt.Chart(df_g2_grp).encode(
+                    x=alt.X('Parecer:N', title=None, axis=alt.Axis(labels=False, ticks=False, domain=False)),
+                    y=alt.Y('Categoria:N', title=None)
+                )
+
+                heatmap = base.mark_rect(cornerRadius=6, stroke='white', strokeWidth=3).encode(
+                    color=alt.Color('Parecer:N', scale=alt.Scale(
+                        domain=list(MAPA_CORES_GRAFICO.keys()),
+                        range=list(MAPA_CORES_GRAFICO.values())
+                    ), legend=None),
+                    opacity=alt.Opacity('Itens:Q', scale=alt.Scale(range=[0.4, 1.0]), legend=None),
+                    tooltip=[
+                        alt.Tooltip('Categoria:N', title='Categoria'),
+                        alt.Tooltip('Parecer:N', title='Status'),
+                        alt.Tooltip('Itens:Q', title='Quantidade')
+                    ]
+                )
+
+                textos = base.mark_text(baseline='middle', fontSize=15, fontWeight='bold', color='#1E293B').encode(
+                    text='Itens:Q'
+                )
+
+                grafico_matriz = (heatmap + textos).properties(height=350)
+                st.altair_chart(grafico_matriz, use_container_width=True)
+            else:
+                st.info("Nenhuma categoria vinculada ativa no filtro atual.")
+
+        # ── LEGENDA UNIFICADA (RODAPÉ) ────────────────────────────────
+        st.write("")
+        legend_html = "<div style='display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 10px; background-color: #F8FAFC; border-radius: 8px; border: 1px solid #E2E8F0;'>"
+        for status, color in MAPA_CORES_GRAFICO.items():
+            legend_html += f"<div style='display: flex; align-items: center;'><div style='width: 14px; height: 14px; background-color: {color}; border-radius: 50%; margin-right: 6px;'></div><span style='font-size: 13px; color: #334155; font-weight: 500;'>{status}</span></div>"
+        legend_html += "</div>"
+        st.markdown(legend_html, unsafe_allow_html=True)
+
+
+        # ── PAINEL INTERATIVO ─────────────────────────────────────────
+        st.write("---")
+        st.markdown("#### 📋 Resultado da Análise Inteligente")
+
+        with st.container(border=True):
+            st.markdown("##### 🔍 Filtros Dinâmicos")
+            f1, f2, f3 = st.columns([2, 2, 1])
+            busca_nome  = f1.text_input("Filtrar por nome ou código:", value="", key="busca_nome")
+            opcoes_alertas = sorted(df_view['Parecer Logístico / Alerta'].unique().tolist())
+            busca_alerta   = f2.multiselect("Filtrar por Parecer:", options=opcoes_alertas, key="busca_alerta")
+            busca_cat      = f3.selectbox("Categoria:", ["TODAS"] + sorted(df_view['Categoria'].unique().tolist()), key="busca_cat")
+
+        df_filtrado = df_view.copy()
+        if busca_nome:
+            df_filtrado = df_filtrado[
+                df_filtrado['Material'].astype(str).str.contains(busca_nome, case=False, na=False, regex=False) |
+                df_filtrado['Código MV'].astype(str).str.contains(busca_nome, case=False, na=False, regex=False)
+            ]
+        if busca_alerta:
+            df_filtrado = df_filtrado[df_filtrado['Parecer Logístico / Alerta'].isin(busca_alerta)]
+        if busca_cat != "TODAS":
+            df_filtrado = df_filtrado[df_filtrado['Categoria'] == busca_cat]
+
+        # Exibir DataFrame com a ordem definida em 'ordem_cols'
+        df_filtrado = df_filtrado.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
+        cols_exibicao = [c for c in ordem_cols if c in df_filtrado.columns]
+        
+        st.dataframe(
+            df_filtrado[cols_exibicao].sort_values('Material'),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Código MV":               st.column_config.TextColumn("Código MV", width="small"),
+                "Material":                st.column_config.TextColumn("Descrição", width="large"),
+                "Categoria":               st.column_config.TextColumn("Categoria", width="medium"),
+                "Estoque Mínimo":          st.column_config.NumberColumn("Mínimo", format="%d"),
+                "Saldo Atual Satélite":    st.column_config.NumberColumn("Saldo", format="%d"),
+                "Cobertura (dias)":        st.column_config.TextColumn("Cobertura", width="small"),
+                "CMD Últ. 3 dias":         st.column_config.NumberColumn("CMD 3 dias", format="%d"),                    
+                "Consumo Médio Diário":    st.column_config.NumberColumn("CMD", format="%d"),
+                COL_SUG:                   st.column_config.NumberColumn("Necessidade", format="%d"),                    
+                "Tendência":               st.column_config.TextColumn("Tend.", width="small"),
+                "Δ% Tendência":            st.column_config.TextColumn("Δ%", width="small"),
+                "⏰ Validade":              st.column_config.TextColumn("Validade", width="medium"),
+                "Saldo Almox. Centrais Unificado": st.column_config.NumberColumn("Saldo Central", format="%d"),
+                "Parecer Logístico / Alerta": st.column_config.TextColumn("Parecer", width="medium"),
+                "Ação Logística Sugerida":    st.column_config.TextColumn("Ação Sugerida", width="large"),
+            }
+        )
+
+        # ── DOWNLOADS ─────────────────────────────────────────────────
+        st.write("")
+        
+        # DataFrame base de exportação para a Aba Única e Filtro
+        df_export_geral = df_view.rename(columns={'Necessidade de Ressuprimento': COL_SUG})[ordem_cols]
+
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            st.download_button(
+                "📥 BAIXAR RELATÓRIO COMPLETO — ABA ÚNICA (.XLSX)",
+                data=exportar_excel_padronizado(df_export_geral, "Painel Geral"),
+                file_name=f"Painel_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
+                use_container_width=True,
+            )
+        with b2:
+            # Relatório operacional por categoria: sem coluna de parecer visível,
+            # mas mantendo as cores por meio de uma coluna auxiliar oculta.
+            col_pedido_label = f'PEDIDO ({dias_pedido} DIAS)'
+            df_pedido_abas = df_view.copy()
+
+            # Observação de validade: mostra somente itens da farmácia ativa que
+            # ainda possuem saldo AGHU e vencem nos próximos 90 dias.
+            df_pedido_abas['Observação'] = ""
+            if 'df_validades_mescladas' in st.session_state:
+                df_val_pedido = st.session_state['df_validades_mescladas'].copy()
+                cod_farm_atual = st.session_state.get('cod_farmacia_alvo', '')
+
+                if not df_val_pedido.empty and {'key', 'Farmácia', 'Dias até Vencer', 'Validade Fmt'}.issubset(df_val_pedido.columns):
+                    df_val_pedido['Dias até Vencer'] = pd.to_numeric(
+                        df_val_pedido['Dias até Vencer'], errors='coerce'
+                    )
+                    if 'Saldo AGHU' in df_val_pedido.columns:
+                        df_val_pedido['Saldo AGHU'] = pd.to_numeric(
+                            df_val_pedido['Saldo AGHU'], errors='coerce'
+                        ).fillna(0)
+                        mask_saldo = df_val_pedido['Saldo AGHU'] > 0
+                    else:
+                        mask_saldo = True
+
+                    df_val_pedido = df_val_pedido[
+                        (df_val_pedido['Farmácia'].astype(str) == str(cod_farm_atual)) &
+                        (df_val_pedido['Dias até Vencer'].between(0, 90, inclusive='both')) &
+                        mask_saldo
+                    ].copy()
+
+                    if not df_val_pedido.empty:
+                        df_val_pedido = df_val_pedido.sort_values(['key', 'Dias até Vencer'])
+                        df_val_pedido['Observação'] = df_val_pedido.apply(
+                            lambda r: (
+                                f"Confirmar se vence em {int(r['Dias até Vencer'])} dia(s) "
+                                f"e não pedir até zerar o estoque"
+                            ),
+                            axis=1
+                        )
+                        mapa_obs_validade = (
+                            df_val_pedido.drop_duplicates('key')
+                            .set_index('key')['Observação']
+                            .to_dict()
+                        )
+                        df_pedido_abas['Observação'] = (
+                            df_pedido_abas['Código MV'].map(mapa_obs_validade).fillna("")
+                        )
+
+            # Coluna auxiliar para manter a coloração por status sem exibir o parecer no relatório.
+            df_pedido_abas['Status para cor'] = df_pedido_abas['Parecer Logístico / Alerta']
+
+            df_pedido_abas = df_pedido_abas.rename(columns={
+                'Necessidade de Ressuprimento': col_pedido_label,
+                'Saldo Atual Satélite': 'Saldo atual da Farmácia',
+            })
+
+            ordem_abas_final = [
+                'Código MV', 'Material', 'Categoria', 'Estoque Mínimo',
+                'Saldo atual da Farmácia', 'Cobertura (dias)', 'Δ% Tendência',
+                col_pedido_label, 'Observação', 'Status para cor'
+            ]
+
+            larguras_pedido_abas = {
+                **larguras_rel,
+                'Saldo atual da Farmácia': 20,
+                col_pedido_label: 20,
+                'Observação': 34,
+                'Status para cor': 26,
+            }
+
+            st.download_button(
+                "📥 BAIXAR PEDIDO - CLASSIFICADO POR CATEGORIA (.XLSX)",
+                data=exportar_excel_multi_aba(
+                    df_pedido_abas,
+                    ordem_abas_final,
+                    col_categoria='Categoria',
+                    col_alerta='Status para cor',
+                    larguras=larguras_pedido_abas,
+                    excluir_acoes=["Avaliar se é necessário inativar o item na farmácia."],
+                    ocultar_colunas=['Status para cor'],
+                    ajustar_altura_linhas=False,
+                ),
+                file_name=f"Pedido_Abas_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
+                use_container_width=True,
+            )
+        with b3:
+            df_filtrado_export = df_filtrado[cols_exibicao]
+            st.download_button(
+                "📥 BAIXAR RESULTADO DA ANÁLISE ATUAL - FILTRADA (.XLSX)",
+                data=exportar_excel_padronizado(df_filtrado_export, "Filtro Atual"),
+                file_name=f"Filtro_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
+                use_container_width=True,
+            )
+    else:
+        st.warning(
+            "⚠️ Nenhum pedido processado nesta sessão. Carregue os arquivos obrigatórios "
+            "na aba **📥 Central de Processamento** e clique em **Analisar os dados**."
+        )
+
+
 # =============================================================================
 # INICIALIZAÇÃO
 # =============================================================================
@@ -1468,13 +2230,305 @@ st.markdown(
 )
 st.write("")
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "⚡ Processar Pedido com IA Logística",
-    "⏰ Controle de Validade",
+tab_processamento, tab_pedido, tab_consolidacao, tab_remanejamentos, tab_validade, tab_categorias = st.tabs([
+    "📥 Central de Processamento",
+    "📦 Pedido da Farmácia Ativa",
     "🏥 Consolidação Multi-Farmácia",
-    "🗂️ Gestão de Categorias de Insumos",
+    "🔄 Remanejamentos",
+    "⏰ Controle de Validade",
+    "🗂️ Categorias",
 ])
 
+# Aliases mantêm a estrutura do código existente e permitem reorganizar o layout
+# sem alterar a lógica de negócio já validada.
+tab1 = tab_processamento
+tab2 = tab_validade
+tab3 = tab_consolidacao
+tab4 = tab_categorias
+
+
+# =============================================================================
+# TAB — PEDIDO DA FARMÁCIA ATIVA
+# =============================================================================
+with tab_pedido:
+    st.subheader("📦 Pedido da Farmácia Ativa")
+    st.caption(
+        "Análise operacional completa gerada a partir dos arquivos carregados na "
+        "aba **📥 Central de Processamento**."
+    )
+    render_painel_pedido_completo()
+
+
+# =============================================================================
+# TAB — REMANEJAMENTOS
+# =============================================================================
+with tab_remanejamentos:
+    st.subheader("🔄 Remanejamentos")
+    st.caption(
+        "Plano operacional para redistribuição entre farmácias. A análise usa a consolidação "
+        "multi-farmácia já processada e mantém as exportações completas e filtradas."
+    )
+
+    if 'df_consolidado' not in st.session_state:
+        st.warning(
+            "⚠️ Gere a consolidação multi-farmácia primeiro na aba **Consolidação Multi-Farmácia**. "
+            "Os remanejamentos dependem dos saldos e CMDs consolidados por farmácia."
+        )
+    else:
+        df_cons = st.session_state['df_consolidado'].copy()
+        st.info(
+            "⏳ Os remanejamentos são calculados a partir da consolidação multi-farmácia. "
+            "Se houver muitos itens, a avaliação pode levar alguns instantes."
+        )
+
+        # ── OPORTUNIDADES DE REMANEJAMENTO ────────────────────────────────
+        st.write("---")
+        st.markdown("#### 🔄 Oportunidades de Remanejamento Entre Farmácias")
+        st.caption(
+            "Aciona remanejamento geral apenas em contingência: há farmácia precisando, "
+            "os almoxarifados fornecedores estão zerados ou insuficientes, e existe saldo em outra farmácia. "
+            "A redistribuição considera o CMD para aproximar a cobertura entre as unidades consumidoras."
+        )
+
+        df_val_rem_geral = st.session_state.get('df_validades_mescladas', pd.DataFrame())
+        if isinstance(df_val_rem_geral, pd.DataFrame) and not df_val_rem_geral.empty and 'est_geral_raw' in st.session_state:
+            df_val_rem_geral = aplicar_saldos_validades(df_val_rem_geral.copy(), st.session_state['est_geral_raw'])
+
+        with st.spinner("🔄 Avaliando oportunidades de remanejamento geral por contingência/equalização..."):
+            df_opor = calcular_remanejamento_equalizado(
+                df_cons,
+                df_val_rem_geral,
+                dias_cobertura=st.session_state.get('dias_pedido_huufma', 15)
+            )
+        if not df_opor.empty and 'Material' in df_opor.columns:
+            df_opor = df_opor.sort_values('Material', kind='mergesort').reset_index(drop=True)
+
+        if df_opor.empty:
+            st.info("Nenhuma oportunidade de remanejamento geral foi identificada: não houve simultaneamente necessidade real por consumo, almoxarifado insuficiente e saldo disponível em outra farmácia.")
+        else:
+            st.success(
+                f"🔄 {len(df_opor)} sugestão(ões) de remanejamento geral por contingência/equalização identificada(s)."
+            )
+
+            # Filtros operacionais: permitem gerar solicitação por origem ou por destino específico.
+            fr1, fr2 = st.columns(2)
+            op_origens = ["TODAS"] + sorted(df_opor['Transferir DE'].dropna().astype(str).unique().tolist())
+            op_destinos = ["TODAS"] + sorted(df_opor['Transferir PARA'].dropna().astype(str).unique().tolist())
+            filtro_origem_rem = fr1.selectbox(
+                "Filtrar farmácia de origem:",
+                op_origens,
+                key="filtro_remanejamento_geral_origem",
+            )
+            filtro_destino_rem = fr2.selectbox(
+                "Filtrar farmácia de destino:",
+                op_destinos,
+                key="filtro_remanejamento_geral_destino",
+            )
+
+            df_opor_view = df_opor.copy()
+            if filtro_origem_rem != "TODAS":
+                df_opor_view = df_opor_view[df_opor_view['Transferir DE'] == filtro_origem_rem]
+            if filtro_destino_rem != "TODAS":
+                df_opor_view = df_opor_view[df_opor_view['Transferir PARA'] == filtro_destino_rem]
+
+            st.caption(
+                f"Exibindo {len(df_opor_view)} de {len(df_opor)} sugestão(ões). "
+                "A exportação abaixo respeita os filtros aplicados."
+            )
+
+            if df_opor_view.empty:
+                st.info("Nenhuma sugestão permaneceu após os filtros selecionados.")
+            else:
+                # A tela fica propositalmente mais enxuta; o Excel exportado continua
+                # levando todas as colunas técnicas calculadas para auditoria e conferência.
+                cols_tela_remanejamento = [
+                    'Código MV', 'Material', 'Saldo almoxarifados fornecedores',
+                    'Transferir DE', 'Transferir PARA', 'Quantidade sugerida remanejar',
+                    'Cobertura alvo hospitalar',
+                    'Cobertura estimada destino após remanejamento',
+                    'Justificativa'
+                ]
+                cols_tela_remanejamento = [c for c in cols_tela_remanejamento if c in df_opor_view.columns]
+
+                df_opor_view_tela = (
+                    df_opor_view
+                    .sort_values('Material', kind='mergesort')
+                    .reset_index(drop=True)
+                )
+                df_opor_view_export = df_opor_view_tela.copy()
+                df_opor_geral_export = (
+                    df_opor
+                    .sort_values('Material', kind='mergesort')
+                    .reset_index(drop=True)
+                )
+
+                st.dataframe(
+                    df_opor_view_tela[cols_tela_remanejamento],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        'Código MV': st.column_config.TextColumn('Código MV', width='small'),
+                        'Material': st.column_config.TextColumn('Material', width='large'),
+                        'Saldo almoxarifados fornecedores': st.column_config.NumberColumn('Saldo almoxarifados', format='%d'),
+                        'Transferir DE': st.column_config.TextColumn('Transferir DE', width='medium'),
+                        'Transferir PARA': st.column_config.TextColumn('Transferir PARA', width='medium'),
+                        'Quantidade sugerida remanejar': st.column_config.NumberColumn('Qtd sugerida', format='%d'),
+                        'Cobertura alvo hospitalar': st.column_config.TextColumn('Cobertura alvo hospitalar', width='medium'),
+                        'Cobertura estimada destino após remanejamento': st.column_config.TextColumn('Cobertura destino após', width='medium'),
+                        'Justificativa': st.column_config.TextColumn('Justificativa', width='large'),
+                    }
+                )
+
+                ex_rem1, ex_rem2 = st.columns(2)
+                with ex_rem1:
+                    st.download_button(
+                        "📥 Exportar remanejamento geral COMPLETO (.xlsx)",
+                        data=exportar_excel_padronizado(df_opor_geral_export, "Remanejamento_Geral"),
+                        file_name=f"Remanejamento_Geral_Completo_{datetime.now().strftime('%d%m%y')}.xlsx",
+                        use_container_width=True,
+                    )
+                with ex_rem2:
+                    st.download_button(
+                        "📥 Exportar remanejamento FILTRADO (.xlsx)",
+                        data=exportar_excel_padronizado(df_opor_view_export, "Remanejamento_Filtrado"),
+                        file_name=f"Remanejamento_Geral_Filtrado_{datetime.now().strftime('%d%m%y')}.xlsx",
+                        use_container_width=True,
+                    )
+
+
+        # ── REMANEJAMENTO PREVENTIVO POR VALIDADE ─────────────────────────
+        st.write("")
+        st.markdown("##### ⏰ Remanejamento preventivo por validade (FEFO)")
+        st.caption(
+            "Identifica itens com validade próxima em uma farmácia e sugere envio para outra "
+            "farmácia que consome o item e não possui alerta de validade para o mesmo código. "
+            "Itens vencidos não entram como oportunidade de remanejamento para uso; devem ser segregados."
+        )
+
+        if 'df_validades_mescladas' not in st.session_state:
+            st.info(
+                "Carregue o Controle de Validade na aba **📥 Central de Processamento** para ativar a análise de "
+                "remanejamento preventivo por vencimento."
+            )
+        else:
+            df_val_rem = st.session_state['df_validades_mescladas'].copy()
+            # Reaplica o saldo do AGHU, quando disponível, para garantir que o alerta seja operacional.
+            if 'est_geral_raw' in st.session_state:
+                df_val_rem = aplicar_saldos_validades(df_val_rem, st.session_state['est_geral_raw'])
+
+            with st.spinner("⏰ Avaliando oportunidades de remanejamento preventivo por validade (FEFO)..."):
+                df_rem_val = calcular_remanejamento_preventivo_validade(df_val_rem, df_cons)
+
+            n_vencidos_sem_remanejo = 0
+            if not df_val_rem.empty and 'Dias até Vencer' in df_val_rem.columns:
+                n_vencidos_sem_remanejo = pd.to_numeric(
+                    df_val_rem['Dias até Vencer'], errors='coerce'
+                ).lt(0).sum()
+
+            if n_vencidos_sem_remanejo:
+                st.warning(
+                    f"💀 {n_vencidos_sem_remanejo} registro(s) vencido(s) não foram considerados "
+                    "para remanejamento preventivo. A conduta esperada é segregação/retirada conforme rotina institucional."
+                )
+
+            if df_rem_val.empty:
+                st.success(
+                    "✅ Nenhuma oportunidade segura de remanejamento preventivo por validade foi identificada."
+                )
+            else:
+                st.success(
+                    f"⏰ {len(df_rem_val)} oportunidade(s) de remanejamento preventivo por validade identificada(s)."
+                )
+
+                # Filtros operacionais: permitem gerar solicitação por origem ou por destino específico,
+                # mantendo a exportação completa para auditoria/conferência.
+                fv_rem1, fv_rem2 = st.columns(2)
+                op_origens_val = ["TODAS"] + sorted(
+                    df_rem_val['Transferir DE'].dropna().astype(str).unique().tolist()
+                )
+                op_destinos_val = ["TODAS"] + sorted(
+                    df_rem_val['Transferir PARA'].dropna().astype(str).unique().tolist()
+                )
+                filtro_origem_val = fv_rem1.selectbox(
+                    "Filtrar farmácia de origem:",
+                    op_origens_val,
+                    key="filtro_remanejamento_validade_origem",
+                )
+                filtro_destino_val = fv_rem2.selectbox(
+                    "Filtrar farmácia de destino:",
+                    op_destinos_val,
+                    key="filtro_remanejamento_validade_destino",
+                )
+
+                df_rem_val_view = df_rem_val.copy()
+                if filtro_origem_val != "TODAS":
+                    df_rem_val_view = df_rem_val_view[df_rem_val_view['Transferir DE'] == filtro_origem_val]
+                if filtro_destino_val != "TODAS":
+                    df_rem_val_view = df_rem_val_view[df_rem_val_view['Transferir PARA'] == filtro_destino_val]
+
+                st.caption(
+                    f"Exibindo {len(df_rem_val_view)} de {len(df_rem_val)} sugestão(ões). "
+                    "A exportação filtrada respeita os filtros aplicados; a exportação geral mantém todas as sugestões."
+                )
+
+                if df_rem_val_view.empty:
+                    st.info("Nenhuma sugestão permaneceu após os filtros selecionados.")
+                else:
+                    # A tela fica propositalmente mais enxuta; os Excel gerados continuam
+                    # levando todas as colunas técnicas calculadas para auditoria e conferência.
+                    cols_tela_validade = [
+                        'Prioridade', 'Código MV', 'Material',
+                        'Transferir DE', 'Transferir PARA', 'Dias até Vencer',
+                        'CMD Destino', 'Consumo Possível no Destino até Validade',
+                        'Qtd Sugerida Remanejar', 'Justificativa'
+                    ]
+                    cols_tela_validade = [c for c in cols_tela_validade if c in df_rem_val_view.columns]
+
+                    df_rem_val_view_tela = (
+                        df_rem_val_view
+                        .sort_values(['Material', 'Dias até Vencer'], kind='mergesort')
+                        .reset_index(drop=True)
+                    )
+                    df_rem_val_export_filtrado = df_rem_val_view_tela.copy()
+                    df_rem_val_export_geral = (
+                        df_rem_val
+                        .sort_values(['Material', 'Dias até Vencer'], kind='mergesort')
+                        .reset_index(drop=True)
+                    )
+
+                    st.dataframe(
+                        df_rem_val_view_tela[cols_tela_validade],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            'Prioridade': st.column_config.TextColumn('Prioridade', width='medium'),
+                            'Código MV': st.column_config.TextColumn('Código', width='small'),
+                            'Material': st.column_config.TextColumn('Material', width='large'),
+                            'Transferir DE': st.column_config.TextColumn('Transferir DE', width='medium'),
+                            'Transferir PARA': st.column_config.TextColumn('Transferir PARA', width='medium'),
+                            'Dias até Vencer': st.column_config.NumberColumn('Dias para vencer', format='%d'),
+                            'CMD Destino': st.column_config.NumberColumn('CMD destino', format='%d'),
+                            'Consumo Possível no Destino até Validade': st.column_config.NumberColumn('Consumo possível até validade', format='%d'),
+                            'Qtd Sugerida Remanejar': st.column_config.NumberColumn('Quantidade sugerida', format='%d'),
+                            'Justificativa': st.column_config.TextColumn('Justificativa', width='large'),
+                        }
+                    )
+
+                    ex_val1, ex_val2 = st.columns(2)
+                    with ex_val1:
+                        st.download_button(
+                            "📥 Exportar remanejamento por validade COMPLETO (.xlsx)",
+                            data=exportar_excel_padronizado(df_rem_val_export_geral, "Remanejamento_Validade"),
+                            file_name=f"Remanejamento_Validade_Completo_{datetime.now().strftime('%d%m%y')}.xlsx",
+                            use_container_width=True,
+                        )
+                    with ex_val2:
+                        st.download_button(
+                            "📥 Exportar remanejamento por validade FILTRADO (.xlsx)",
+                            data=exportar_excel_padronizado(df_rem_val_export_filtrado, "Remanejamento_Val_Filtro"),
+                            file_name=f"Remanejamento_Validade_Filtrado_{datetime.now().strftime('%d%m%y')}.xlsx",
+                            use_container_width=True,
+                        )
 
 
 
@@ -1484,91 +2538,34 @@ tab1, tab2, tab3, tab4 = st.tabs([
 with tab2:
     st.subheader("⏰ Controle de Validade — FEFO")
 
-    # ── CONFIGURAÇÃO DO SHAREPOINT ────────────────────────────────────────────
+    # ── FONTE DE DADOS ─────────────────────────────────────────────────────────
     with st.container(border=True):
-        st.markdown("##### 🔗 Fonte de Dados de Validade")
+        st.markdown("##### 📥 Fonte de dados de validade")
+        ultima_carga_val = st.session_state.get('validade_ultima_carga')
+        origem_val = st.session_state.get('validade_ultima_origem', 'não informada')
 
-        # Status da última carga automática
-        ultima_carga = st.session_state.get('sharepoint_ultima_carga', None)
-        if ultima_carga:
-            st.success(f"✅ SharePoint carregado com sucesso em: **{ultima_carga}**")
+        if 'df_validades_mescladas' in st.session_state:
+            st.success(
+                f"✅ Validades carregadas pela **Central de Processamento** em "
+                f"**{ultima_carga_val or 'horário não registrado'}**. Fonte: **{origem_val}**."
+            )
         else:
             st.info(
-                "🔗 A planilha de validades será carregada automaticamente do SharePoint "
-                "(conta farmaciahuufma@outlook.com). Clique no botão abaixo para carregar."
+                "⬆️ O Controle de Validade agora é carregado na aba **📥 Central de Processamento**, "
+                "junto com o Estoque Geral e os arquivos de movimento. Esta aba fica reservada "
+                "para consulta, filtros e exportações do painel FEFO."
             )
 
-        c_sp1, c_sp2 = st.columns([2, 1])
-        file_val_manual = c_sp1.file_uploader(
-            "📎 Carregar manualmente (usado se o SharePoint falhar):",
-            type=['xlsx', 'xls'], key='upload_validades'
-        )
-        carregar_val = c_sp2.button(
-            "🔄 Carregar / Atualizar Validades", use_container_width=True
-        )
-
-    # ── CARREGAMENTO ──────────────────────────────────────────────────────────
-    if carregar_val or 'df_validades_mescladas' not in st.session_state:
-        df_sp_raw = None
-        erro_sp   = ''
-
-        # 1. Tentar SharePoint autenticado (conta convidada)
-        with st.spinner("🌐 Conectando ao SharePoint..."):
-            df_sp_raw, erro_sp = carregar_validades_sharepoint()
-
-        # 2. Fallback para upload manual
-        if df_sp_raw is None:
-            if erro_sp:
-                st.warning(
-                    f"⚠️ **Não foi possível acessar o SharePoint:** {erro_sp}\n\n"
-                    "Carregue o arquivo manualmente pelo campo acima para continuar."
+        if st.button("🔁 Reaplicar filtro de saldo AGHU no painel de validades", use_container_width=True):
+            if 'df_validades_mescladas' in st.session_state and 'est_geral_raw' in st.session_state:
+                st.session_state['df_validades_mescladas'] = aplicar_saldo_atual_validades(
+                    st.session_state['df_validades_mescladas'], st.session_state['est_geral_raw']
                 )
-            if file_val_manual:
-                file_val_manual.seek(0)
-                df_sp_raw = carregar_planilha_validades_excel(io.BytesIO(file_val_manual.read()))
-                st.info("📎 Usando arquivo carregado manualmente.")
-        
-        if df_sp_raw is None:
-            st.error(
-                "❌ Não foi possível carregar as validades automaticamente e nenhum "
-                "arquivo foi carregado manualmente. Verifique a conexão ou carregue o arquivo."
-            )
-        else:
-            df_sp_norm = normalizar_planilha_validades(df_sp_raw)
-            if df_sp_norm.empty:
-                st.error(
-                    "❌ A planilha de validades não pôde ser interpretada. "
-                    "Verifique se tem colunas de Código MV e Validade identificáveis."
-                )
+                st.success("✅ Filtro de saldo AGHU reaplicado ao painel de validades.")
+            elif 'df_validades_mescladas' not in st.session_state:
+                st.warning("⚠️ Ainda não há controle de validade carregado nesta sessão.")
             else:
-                # 3. Extrair validades do AGHU (se estoque já foi processado)
-                df_aghu_val = pd.DataFrame()
-                if 'est_geral_raw' in st.session_state:
-                    df_aghu_val = extrair_validades_aghu(
-                        st.session_state['est_geral_raw']
-                    )
-
-                df_val_final = mesclar_validades(df_aghu_val, df_sp_norm)
-                mapa_cat_val = obter_mapa_categorias()
-                est_geral_para_saldo = st.session_state.get('est_geral_raw')
-                st.session_state['df_validades_mescladas'] = preparar_painel_validades(
-                    df_val_final, mapa_cat_val, est_geral_para_saldo
-                )
-                n_aghu = len(df_aghu_val)
-                n_sp   = len(df_sp_norm)
-                n_painel = len(st.session_state['df_validades_mescladas'])
-                tem_estoque_aghu = est_geral_para_saldo is not None and not est_geral_para_saldo.empty
-                complemento_filtro = (
-                    f" Após filtro por **Saldo AGHU > 0**, permanecem **{n_painel}** registros no painel."
-                    if tem_estoque_aghu else
-                    f" **{n_painel}** registros foram mantidos no painel provisório, sem filtro por AGHU."
-                )
-                st.success(
-                    f"✅ Validades carregadas: **{n_aghu}** registros do AGHU + "
-                    f"**{n_sp}** da planilha da equipe → "
-                    f"**{len(df_val_final)}** registros candidatos após mesclagem."
-                    + complemento_filtro
-                )
+                st.warning("⚠️ Processe primeiro o Estoque Geral AGHU para aplicar o filtro de saldo atual.")
 
     # ── PAINEL DE VALIDADES ───────────────────────────────────────────────────
     if 'df_validades_mescladas' in st.session_state:
@@ -1689,10 +2686,9 @@ with tab2:
             )
     else:
         st.info(
-            "⬆️ Configure a URL do SharePoint ou carregue o arquivo de validades acima "
-            "e clique em **Carregar / Atualizar Validades**.\n\n"
-            "💡 Dica: processe o pedido na **Aba 1** antes — isso permite que o app "
-            "já extraia as validades presentes no arquivo de estoque do AGHU automaticamente."
+            "⬆️ Carregue o **Controle de Validade** na aba **📥 Central de Processamento**.\n\n"
+            "💡 Dica: processe primeiro o Estoque Geral AGHU; assim o painel FEFO já "
+            "oculta automaticamente os itens que não possuem saldo atual na farmácia correspondente."
         )
 
 
@@ -1798,111 +2794,13 @@ with tab3:
                     'N_Farmacias': 'Nº Farmácias', 'Farmacias': 'Farmácias Afetadas'
                 }), use_container_width=True, hide_index=True)
 
-            # ── OPORTUNIDADES DE REMANEJAMENTO ────────────────────────────────
+            # ── REMANEJAMENTOS ────────────────────────────────────────────
             st.write("---")
-            st.markdown("#### 🔄 Oportunidades de Remanejamento Entre Farmácias")
-            st.caption("Item com excesso em uma farmácia e necessidade em outra.")
-
-            df_exc = df_cons[df_cons['Parecer'].isin(['Estoque Excessivo', 'Estoque Parado'])][
-                ['Código MV', 'Material', 'Categoria', 'Farmácia', 'Saldo Atual', 'CMD']
-            ].copy()
-            df_nec = df_cons[df_cons['Parecer'] == 'Desabastecimento Crítico'][
-                ['Código MV', 'Farmácia', 'Necessidade']
-            ].copy()
-
-            if df_exc.empty or df_nec.empty:
-                st.info("Nenhuma oportunidade de remanejamento identificada no momento.")
-            else:
-                df_opor = df_exc.merge(
-                    df_nec, on='Código MV', suffixes=('_origem', '_destino')
-                )
-                df_opor = df_opor[
-                    df_opor['Farmácia_origem'] != df_opor['Farmácia_destino']
-                ].rename(columns={
-                    'Farmácia_origem': 'Transferir DE',
-                    'Farmácia_destino': 'Transferir PARA',
-                    'Saldo Atual': 'Saldo Origem',
-                    'Necessidade': 'Qtd Necessária',
-                })[['Código MV', 'Material', 'Categoria',
-                    'Transferir DE', 'Saldo Origem', 'Transferir PARA', 'Qtd Necessária']]
-
-                if df_opor.empty:
-                    st.info("Nenhuma oportunidade de remanejamento identificada.")
-                else:
-                    st.success(f"🔄 {len(df_opor)} oportunidade(s) de remanejamento identificada(s).")
-                    st.dataframe(df_opor, use_container_width=True, hide_index=True)
-
-
-            # ── REMANEJAMENTO PREVENTIVO POR VALIDADE ─────────────────────────
-            st.write("")
-            st.markdown("##### ⏰ Remanejamento preventivo por validade (FEFO)")
-            st.caption(
-                "Identifica itens com validade próxima em uma farmácia e sugere envio para outra "
-                "farmácia que consome o item e não possui alerta de validade para o mesmo código. "
-                "Itens vencidos não entram como oportunidade de remanejamento para uso; devem ser segregados."
+            st.info(
+                "🔄 As análises de remanejamento geral e remanejamento preventivo por validade "
+                "foram movidas para a aba **Remanejamentos**, mantendo a consolidação aqui como "
+                "painel comparativo multi-farmácia."
             )
-
-            if 'df_validades_mescladas' not in st.session_state:
-                st.info(
-                    "Carregue o Controle de Validade na Aba 2 para ativar a análise de "
-                    "remanejamento preventivo por vencimento."
-                )
-            else:
-                df_val_rem = st.session_state['df_validades_mescladas'].copy()
-                # Reaplica o saldo do AGHU, quando disponível, para garantir que o alerta seja operacional.
-                if 'est_geral_raw' in st.session_state:
-                    df_val_rem = aplicar_saldos_validades(df_val_rem, st.session_state['est_geral_raw'])
-
-                df_rem_val = calcular_remanejamento_preventivo_validade(df_val_rem, df_cons)
-
-                n_vencidos_sem_remanejo = 0
-                if not df_val_rem.empty and 'Dias até Vencer' in df_val_rem.columns:
-                    n_vencidos_sem_remanejo = pd.to_numeric(
-                        df_val_rem['Dias até Vencer'], errors='coerce'
-                    ).lt(0).sum()
-
-                if n_vencidos_sem_remanejo:
-                    st.warning(
-                        f"💀 {n_vencidos_sem_remanejo} registro(s) vencido(s) não foram considerados "
-                        "para remanejamento preventivo. A conduta esperada é segregação/retirada conforme rotina institucional."
-                    )
-
-                if df_rem_val.empty:
-                    st.success(
-                        "✅ Nenhuma oportunidade segura de remanejamento preventivo por validade foi identificada."
-                    )
-                else:
-                    st.success(
-                        f"⏰ {len(df_rem_val)} oportunidade(s) de remanejamento preventivo por validade identificada(s)."
-                    )
-                    st.dataframe(
-                        df_rem_val,
-                        use_container_width=True,
-                        hide_index=True,
-                        column_config={
-                            'Prioridade': st.column_config.TextColumn('Prioridade', width='medium'),
-                            'Código MV': st.column_config.TextColumn('Código MV', width='small'),
-                            'Material': st.column_config.TextColumn('Material', width='large'),
-                            'Transferir DE': st.column_config.TextColumn('Transferir DE', width='medium'),
-                            'Transferir PARA': st.column_config.TextColumn('Transferir PARA', width='medium'),
-                            'Dias até Vencer': st.column_config.NumberColumn('Dias até vencer', format='%d'),
-                            'Saldo AGHU': st.column_config.NumberColumn('Saldo origem AGHU', format='%d'),
-                            'CMD Origem': st.column_config.NumberColumn('CMD origem', format='%d'),
-                            'Qtd em Risco na Origem': st.column_config.NumberColumn('Qtd em risco', format='%d'),
-                            'CMD Destino': st.column_config.NumberColumn('CMD destino', format='%d'),
-                            'Saldo Destino': st.column_config.NumberColumn('Saldo destino', format='%d'),
-                            'Necessidade Destino': st.column_config.NumberColumn('Necessidade destino', format='%d'),
-                            'Consumo Possível no Destino até Validade': st.column_config.NumberColumn('Consumo possível até validade', format='%d'),
-                            'Qtd Sugerida Remanejar': st.column_config.NumberColumn('Qtd sugerida', format='%d'),
-                            'Justificativa': st.column_config.TextColumn('Justificativa', width='large'),
-                        }
-                    )
-                    st.download_button(
-                        "📥 Exportar remanejamento preventivo por validade (.xlsx)",
-                        data=exportar_excel_padronizado(df_rem_val, "Remanejamento_Validade"),
-                        file_name=f"Remanejamento_Validade_{datetime.now().strftime('%d%m%y')}.xlsx",
-                        use_container_width=True,
-                    )
 
             # ── VALIDADES CRÍTICAS NA CONSOLIDAÇÃO ───────────────────────────
             if 'df_validades_mescladas' in st.session_state:
@@ -2036,11 +2934,11 @@ with tab4:
 
 
 # =============================================================================
-# TAB 1 — PROCESSAR PEDIDO
+# TAB 1 — CENTRAL DE PROCESSAMENTO
 # =============================================================================
 with tab1:
     with st.container(border=True):
-        st.markdown("##### 📥 Upload das Fontes de Dados Obrigatórias (AGHU)")
+        st.markdown("##### 📥 Central de Processamento das Fontes de Dados")
         col1, col2 = st.columns(2)
         file_mov_alvo  = col1.file_uploader("1. Movimento da Farmácia Alvo (.csv)", type=["csv"])
         file_est_geral = col2.file_uploader("2. Estoque Geral de todos os Almoxarifados (.csv)", type=["csv"])
@@ -2049,6 +2947,66 @@ with tab1:
             "3. Movimentos das outras Farmácias — Ativa a análise da viabilidade de remanejamentos (opcional) (Múltiplos.csv)",
             type=["csv"], accept_multiple_files=True,
         )
+
+    with st.container(border=True):
+        st.markdown("##### ⏰ Controle de Validade — fonte complementar recomendada")
+        st.caption(
+            "Carregue aqui a planilha de validade para que o pedido, o painel FEFO e os "
+            "remanejamentos preventivos já sejam processados de forma integrada."
+        )
+
+        status_val = st.session_state.get('validade_ultima_carga')
+        origem_val = st.session_state.get('validade_ultima_origem', '')
+        if 'df_validades_mescladas' in st.session_state:
+            st.success(
+                f"✅ Validades carregadas em **{status_val or 'horário não registrado'}**"
+                + (f" — Fonte: **{origem_val}**" if origem_val else "")
+            )
+        else:
+            st.info("Controle de validade ainda não carregado nesta sessão.")
+
+        cv1, cv2 = st.columns([2, 1])
+        file_val_manual_central = cv1.file_uploader(
+            "4. Controle de Validade (.xlsx) — opcional, mas recomendado",
+            type=['xlsx', 'xls'],
+            key='upload_validades_central',
+            help="Se este arquivo for enviado, ele será usado como fonte de validade. Se não for enviado, o botão tentará carregar via SharePoint."
+        )
+        carregar_val_central = cv2.button(
+            "🔄 Carregar / Atualizar Validades",
+            use_container_width=True,
+            key='btn_carregar_validades_central'
+        )
+
+        if carregar_val_central:
+            df_sp_raw_central = None
+            origem_central = ""
+
+            if file_val_manual_central is not None:
+                try:
+                    file_val_manual_central.seek(0)
+                    df_sp_raw_central = carregar_planilha_validades_excel(
+                        io.BytesIO(file_val_manual_central.read())
+                    )
+                    origem_central = f"upload manual ({file_val_manual_central.name})"
+                except Exception as e:
+                    st.error(f"❌ Erro ao ler o arquivo manual de validade: {e}")
+            else:
+                with st.spinner("🌐 Tentando carregar validades do SharePoint..."):
+                    df_sp_raw_central, erro_sp_central = carregar_validades_sharepoint()
+                origem_central = "SharePoint"
+                if df_sp_raw_central is None:
+                    st.warning(
+                        f"⚠️ Não foi possível acessar o SharePoint: {erro_sp_central}\n\n"
+                        "Carregue o arquivo manualmente no campo acima e clique novamente em atualizar."
+                    )
+
+            if df_sp_raw_central is not None:
+                ok_val, msg_val = processar_validades_para_sessao(df_sp_raw_central, origem_central)
+                if ok_val:
+                    st.success(f"✅ {msg_val}")
+                else:
+                    st.error(f"❌ {msg_val}")
 
     st.write("")
 
@@ -2069,9 +3027,28 @@ with tab1:
                 st.session_state['est_geral_raw']  = est_geral
                 st.session_state['mov_alvo_raw']   = mov
 
-                # Se as validades já foram carregadas antes do Estoque Geral,
-                # recalcula os saldos de validade e aplica o filtro operacional: Saldo AGHU > 0.
-                if 'df_validades_mescladas' in st.session_state:
+                # Controle de validade integrado à Central de Processamento:
+                # se o usuário anexou o arquivo de validade na Central, ele é processado
+                # junto com o Estoque Geral, já aplicando o filtro Saldo AGHU > 0.
+                if 'file_val_manual_central' in locals() and file_val_manual_central is not None:
+                    try:
+                        file_val_manual_central.seek(0)
+                        df_val_upload_proc = carregar_planilha_validades_excel(
+                            io.BytesIO(file_val_manual_central.read())
+                        )
+                        ok_val_proc, msg_val_proc = processar_validades_para_sessao(
+                            df_val_upload_proc,
+                            f"upload manual ({file_val_manual_central.name})"
+                        )
+                        if ok_val_proc:
+                            st.toast("✅ Controle de validade integrado ao processamento.", icon="⏰")
+                        else:
+                            st.warning(f"⚠️ Controle de validade não processado: {msg_val_proc}")
+                    except Exception as e:
+                        st.warning(f"⚠️ Controle de validade ignorado por erro na leitura: {e}")
+                elif 'df_validades_mescladas' in st.session_state:
+                    # Se as validades já foram carregadas antes do Estoque Geral,
+                    # recalcula os saldos de validade e aplica o filtro operacional: Saldo AGHU > 0.
                     st.session_state['df_validades_mescladas'] = aplicar_saldo_atual_validades(
                         st.session_state['df_validades_mescladas'], est_geral
                     )
@@ -2409,356 +3386,13 @@ with tab1:
                     mapa_val = df_sorted.set_index('key')['🚦'] + ' ' + df_sorted.set_index('key')['Situação']
                     df_atual['⏰ Validade'] = df_atual['Código MV'].map(mapa_val).fillna('—')
                     st.session_state['df_final_huufma'] = df_atual
-        # =================================================================
-        # PAINEL DE RESULTADOS
-        # =================================================================
         if 'df_final_huufma' in st.session_state:
-            df_view         = st.session_state['df_final_huufma'].copy()
-            n_dias_efetivos = st.session_state.get('n_dias_efetivos_huufma', '—')
-            datas_vazias    = st.session_state.get('datas_sem_movimento_huufma', [])
-            cod_farmacia_alvo = st.session_state.get('cod_farmacia_alvo', 'Alvo')
-
-            if datas_vazias:
-                st.warning(
-                    f"⚠️ **Auditoria de Calendário:** Sem movimentação em "
-                    f"`{len(datas_vazias)}` dia(s) do período: "
-                    f"`{', '.join(datas_vazias)}`. "
-                    f"O CMD foi calculado com **{n_dias_efetivos} dias efetivos** de movimento."
-                )
-            else:
-                st.info(
-                    f"✅ **Calendário completo:** Todos os dias do período tiveram movimento. "
-                    f"CMD calculado com **{n_dias_efetivos} dias efetivos**."
-                )
-
-            # ── BADGE RESUMO DE VALIDADES (itens deste pedido com validade crítica) ──
-            if '⏰ Validade' in df_view.columns:
-                n_venc_pedido = df_view['⏰ Validade'].str.contains('VENCIDO', na=False).sum()
-                n_crit_pedido = df_view['⏰ Validade'].str.contains('Crítico', na=False).sum()
-                if n_venc_pedido > 0 or n_crit_pedido > 0:
-                    partes = []
-                    if n_venc_pedido > 0:
-                        partes.append(f"**{n_venc_pedido}** vencido(s)")
-                    if n_crit_pedido > 0:
-                        partes.append(f"**{n_crit_pedido}** crítico(s) (≤30 dias)")
-                    st.error(
-                        f"⏰ **Atenção às validades:** {' e '.join(partes)} entre os itens desta análise. "
-                        f"Veja a coluna **⏰ Validade** na tabela abaixo ou confira o detalhe completo na "
-                        f"aba **Controle de Validade**."
-                    )
-                elif 'df_validades_mescladas' in st.session_state:
-                    st.success("⏰ **Validades:** nenhum item desta farmácia está vencido ou em estado crítico.")
-
-            st.write("---")
-
-            diag = st.session_state.get('diagnostico_categorias', {})
-            if diag:
-                pct = round(diag['mapeados'] / max(diag['total'], 1) * 100, 1)
-                if diag['outros'] > 0:
-                    st.warning(
-                        f"🏷️ **Cobertura de Categorias:** {diag['mapeados']} de {diag['total']} itens "
-                        f"classificados ({pct}%). **{diag['outros']} item(ns) como 'OUTROS'.**"
-                    )
-                else:
-                    st.success(
-                        f"🏷️ **Categorias:** 100% dos {diag['total']} itens classificados."
-                    )
-
-            # ── DEFINIÇÃO DAS VARIÁVEIS DE ORDEM PARA TODOS OS DOWNLOADS E PAINEL ──
-            COL_SUG = f'Necessidade de Ressuprimento ({dias_pedido} dias)'
-            ordem_cols = [
-                'Código MV', 'Material', 'Categoria',
-                'Estoque Mínimo', 'Saldo Atual Satélite', 'Cobertura (dias)',
-                'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG,
-                'Tendência', 'Δ% Tendência', '⏰ Validade',
-                'Saldo Almox. Centrais Unificado',
-                'Parecer Logístico / Alerta', 'Ação Logística Sugerida',
-            ]
-            larguras_rel = {
-                'Código MV': 12, 'Material': 45, 'Categoria': 16,
-                'Estoque Mínimo': 16, 'Saldo Atual Satélite': 18,
-                'Cobertura (dias)': 14, 'CMD Últ. 3 dias': 16,
-                'Consumo Médio Diário': 18, COL_SUG: 26,
-                f'PEDIDO ({dias_pedido} DIAS)': 20,
-                'Tendência': 10, 'Δ% Tendência': 12, '⏰ Validade': 18,
-                'Saldo Almox. Centrais Unificado': 28,
-                'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
-            }
-
-            def _preparar_df_card(df_raw: pd.DataFrame) -> pd.DataFrame:
-                df = df_raw.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
-                cols_ok = [c for c in ordem_cols if c in df.columns]
-                return df[cols_ok]
-
-            # ── MÉTRICAS ─────────────────────────────────────────────────
-            df_desabast = df_view[df_view['Parecer Logístico / Alerta'] == "Desabastecimento Crítico"].sort_values('Material')
-            df_remanej  = df_view[df_view['Parecer Logístico / Alerta'] == "Remanejar"].sort_values('Material')
-            df_caf      = df_view[df_view['Parecer Logístico / Alerta'].str.contains("Solicitar|Almoxarifado", na=False)].sort_values('Material')
-            df_excesso  = df_view[df_view['Parecer Logístico / Alerta'].isin(
-                ["Estoque Excessivo", "Estoque Parado"]
-            )].sort_values('Material')
-
-            c0, c1, c2, c3, c4 = st.columns(5)
-            c0.metric("📅 Dias Efetivos de Consumo",
-                      f"{n_dias_efetivos} dias",
-                      delta=f"-{len(datas_vazias)} sem mov." if datas_vazias else "Período completo",
-                      delta_color="inverse" if datas_vazias else "normal")
-            with c1:
-                st.metric("🚨 Desabastecimento Crítico", f"{len(df_desabast)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_desabast), "Rupturas"),
-                    file_name=f"Rupturas_{cod_farmacia_alvo}.xlsx", key="ex_c1", use_container_width=True)
-            with c2:
-                st.metric("🔄 Remanejamento Potencial", f"{len(df_remanej)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_remanej), "Remanejamento"),
-                    file_name=f"Remanejamento_{cod_farmacia_alvo}.xlsx", key="ex_c2", use_container_width=True)
-            with c3:
-                st.metric("📦 Disponível no Almoxarifado", f"{len(df_caf)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_caf), "Disponiveis_CAF"),
-                    file_name=f"Disponiveis_{cod_farmacia_alvo}.xlsx", key="ex_c3", use_container_width=True)
-            with c4:
-                st.metric("⚠️ Excesso / Sem Giro", f"{len(df_excesso)} itens")
-                st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_excesso), "Overstock"),
-                    file_name=f"Overstock_{cod_farmacia_alvo}.xlsx", key="ex_c4", use_container_width=True)
-
-            # ── GRÁFICOS ──────────────────────────────────────
-            st.write("")
-            g1, g2 = st.columns(2)
-
-            with g1:
-                st.markdown("**Saúde Geral do Estoque**")
-                df_g1 = df_view.copy()
-                df_g1.loc[
-                    df_g1['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False),
-                    'Parecer Logístico / Alerta'
-                ] = "Estoque Crítico CAF"
-                df_g1_grp = (
-                    df_g1[df_g1['Parecer Logístico / Alerta'] != 'Sem Consumo']
-                    .groupby('Parecer Logístico / Alerta')['Código MV'].count()
-                    .reset_index()
-                    .rename(columns={'Código MV': 'Quantidade', 'Parecer Logístico / Alerta': 'Status'})
-                )
-                if not df_g1_grp.empty:
-                    st.altair_chart(
-                        alt.Chart(df_g1_grp).mark_arc(innerRadius=65, stroke='#fff').encode(
-                            theta=alt.Theta('Quantidade:Q'),
-                            color=alt.Color('Status:N', scale=alt.Scale(
-                                domain=list(MAPA_CORES_GRAFICO.keys()),
-                                range=list(MAPA_CORES_GRAFICO.values())
-                            ), legend=None),
-                            tooltip=['Status:N', 'Quantidade:Q']
-                        ).properties(height=350),
-                        use_container_width=True
-                    )
-
-            with g2:
-                st.markdown("**Matriz de Urgência por Categoria**")
-                df_g2 = df_view[df_view['Categoria'] != 'OUTROS'].copy()
-                df_g2.loc[
-                    df_g2['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False),
-                    'Parecer Logístico / Alerta'
-                ] = "Estoque Crítico CAF"
-                
-                df_g2_grp = (
-                    df_g2[df_g2['Parecer Logístico / Alerta'] != 'Sem Consumo']
-                    .groupby(['Categoria', 'Parecer Logístico / Alerta'])['Código MV'].count()
-                    .reset_index()
-                    .rename(columns={'Código MV': 'Itens', 'Parecer Logístico / Alerta': 'Parecer'})
-                )
-                
-                if not df_g2_grp.empty:
-                    base = alt.Chart(df_g2_grp).encode(
-                        x=alt.X('Parecer:N', title=None, axis=alt.Axis(labels=False, ticks=False, domain=False)),
-                        y=alt.Y('Categoria:N', title=None)
-                    )
-
-                    heatmap = base.mark_rect(cornerRadius=6, stroke='white', strokeWidth=3).encode(
-                        color=alt.Color('Parecer:N', scale=alt.Scale(
-                            domain=list(MAPA_CORES_GRAFICO.keys()),
-                            range=list(MAPA_CORES_GRAFICO.values())
-                        ), legend=None),
-                        opacity=alt.Opacity('Itens:Q', scale=alt.Scale(range=[0.4, 1.0]), legend=None),
-                        tooltip=[
-                            alt.Tooltip('Categoria:N', title='Categoria'),
-                            alt.Tooltip('Parecer:N', title='Status'),
-                            alt.Tooltip('Itens:Q', title='Quantidade')
-                        ]
-                    )
-
-                    textos = base.mark_text(baseline='middle', fontSize=15, fontWeight='bold', color='#1E293B').encode(
-                        text='Itens:Q'
-                    )
-
-                    grafico_matriz = (heatmap + textos).properties(height=350)
-                    st.altair_chart(grafico_matriz, use_container_width=True)
-                else:
-                    st.info("Nenhuma categoria vinculada ativa no filtro atual.")
-
-            # ── LEGENDA UNIFICADA (RODAPÉ) ────────────────────────────────
-            st.write("")
-            legend_html = "<div style='display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 10px; background-color: #F8FAFC; border-radius: 8px; border: 1px solid #E2E8F0;'>"
-            for status, color in MAPA_CORES_GRAFICO.items():
-                legend_html += f"<div style='display: flex; align-items: center;'><div style='width: 14px; height: 14px; background-color: {color}; border-radius: 50%; margin-right: 6px;'></div><span style='font-size: 13px; color: #334155; font-weight: 500;'>{status}</span></div>"
-            legend_html += "</div>"
-            st.markdown(legend_html, unsafe_allow_html=True)
-
-
-            # ── PAINEL INTERATIVO ─────────────────────────────────────────
-            st.write("---")
-            st.markdown("#### 📋 Resultado da Análise Inteligente")
-
-            with st.container(border=True):
-                st.markdown("##### 🔍 Filtros Dinâmicos")
-                f1, f2, f3 = st.columns([2, 2, 1])
-                busca_nome  = f1.text_input("Filtrar por nome ou código:", value="", key="busca_nome")
-                opcoes_alertas = sorted(df_view['Parecer Logístico / Alerta'].unique().tolist())
-                busca_alerta   = f2.multiselect("Filtrar por Parecer:", options=opcoes_alertas, key="busca_alerta")
-                busca_cat      = f3.selectbox("Categoria:", ["TODAS"] + sorted(df_view['Categoria'].unique().tolist()), key="busca_cat")
-
-            df_filtrado = df_view.copy()
-            if busca_nome:
-                df_filtrado = df_filtrado[
-                    df_filtrado['Material'].astype(str).str.contains(busca_nome, case=False, na=False, regex=False) |
-                    df_filtrado['Código MV'].astype(str).str.contains(busca_nome, case=False, na=False, regex=False)
-                ]
-            if busca_alerta:
-                df_filtrado = df_filtrado[df_filtrado['Parecer Logístico / Alerta'].isin(busca_alerta)]
-            if busca_cat != "TODAS":
-                df_filtrado = df_filtrado[df_filtrado['Categoria'] == busca_cat]
-
-            # Exibir DataFrame com a ordem definida em 'ordem_cols'
-            df_filtrado = df_filtrado.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
-            cols_exibicao = [c for c in ordem_cols if c in df_filtrado.columns]
-            
-            st.dataframe(
-                df_filtrado[cols_exibicao].sort_values('Material'),
-                use_container_width=True, hide_index=True,
-                column_config={
-                    "Código MV":               st.column_config.TextColumn("Código MV", width="small"),
-                    "Material":                st.column_config.TextColumn("Descrição", width="large"),
-                    "Categoria":               st.column_config.TextColumn("Categoria", width="medium"),
-                    "Estoque Mínimo":          st.column_config.NumberColumn("Mínimo", format="%d"),
-                    "Saldo Atual Satélite":    st.column_config.NumberColumn("Saldo", format="%d"),
-                    "Cobertura (dias)":        st.column_config.TextColumn("Cobertura", width="small"),
-                    "CMD Últ. 3 dias":         st.column_config.NumberColumn("CMD 3 dias", format="%d"),                    
-                    "Consumo Médio Diário":    st.column_config.NumberColumn("CMD", format="%d"),
-                    COL_SUG:                   st.column_config.NumberColumn("Necessidade", format="%d"),                    
-                    "Tendência":               st.column_config.TextColumn("Tend.", width="small"),
-                    "Δ% Tendência":            st.column_config.TextColumn("Δ%", width="small"),
-                    "⏰ Validade":              st.column_config.TextColumn("Validade", width="medium"),
-                    "Saldo Almox. Centrais Unificado": st.column_config.NumberColumn("Saldo Central", format="%d"),
-                    "Parecer Logístico / Alerta": st.column_config.TextColumn("Parecer", width="medium"),
-                    "Ação Logística Sugerida":    st.column_config.TextColumn("Ação Sugerida", width="large"),
-                }
+            st.success(
+                '✅ Dados processados com sucesso. A análise operacional completa está disponível na aba **📦 Pedido da Farmácia Ativa**.'
             )
-
-            # ── DOWNLOADS ─────────────────────────────────────────────────
-            st.write("")
-            
-            # DataFrame base de exportação para a Aba Única e Filtro
-            df_export_geral = df_view.rename(columns={'Necessidade de Ressuprimento': COL_SUG})[ordem_cols]
-
-            b1, b2, b3 = st.columns(3)
-            with b1:
-                st.download_button(
-                    "📥 BAIXAR RELATÓRIO COMPLETO — ABA ÚNICA (.XLSX)",
-                    data=exportar_excel_padronizado(df_export_geral, "Painel Geral"),
-                    file_name=f"Painel_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
-                    use_container_width=True,
-                )
-            with b2:
-                # Relatório operacional por categoria: sem coluna de parecer visível,
-                # mas mantendo as cores por meio de uma coluna auxiliar oculta.
-                col_pedido_label = f'PEDIDO ({dias_pedido} DIAS)'
-                df_pedido_abas = df_view.copy()
-
-                # Observação de validade: mostra somente itens da farmácia ativa que
-                # ainda possuem saldo AGHU e vencem nos próximos 90 dias.
-                df_pedido_abas['Observação'] = ""
-                if 'df_validades_mescladas' in st.session_state:
-                    df_val_pedido = st.session_state['df_validades_mescladas'].copy()
-                    cod_farm_atual = st.session_state.get('cod_farmacia_alvo', '')
-
-                    if not df_val_pedido.empty and {'key', 'Farmácia', 'Dias até Vencer', 'Validade Fmt'}.issubset(df_val_pedido.columns):
-                        df_val_pedido['Dias até Vencer'] = pd.to_numeric(
-                            df_val_pedido['Dias até Vencer'], errors='coerce'
-                        )
-                        if 'Saldo AGHU' in df_val_pedido.columns:
-                            df_val_pedido['Saldo AGHU'] = pd.to_numeric(
-                                df_val_pedido['Saldo AGHU'], errors='coerce'
-                            ).fillna(0)
-                            mask_saldo = df_val_pedido['Saldo AGHU'] > 0
-                        else:
-                            mask_saldo = True
-
-                        df_val_pedido = df_val_pedido[
-                            (df_val_pedido['Farmácia'].astype(str) == str(cod_farm_atual)) &
-                            (df_val_pedido['Dias até Vencer'].between(0, 90, inclusive='both')) &
-                            mask_saldo
-                        ].copy()
-
-                        if not df_val_pedido.empty:
-                            df_val_pedido = df_val_pedido.sort_values(['key', 'Dias até Vencer'])
-                            df_val_pedido['Observação'] = df_val_pedido.apply(
-                                lambda r: (
-                                    f"Confirmar se vence em {int(r['Dias até Vencer'])} dia(s) "
-                                    f"e não pedir até zerar o estoque"
-                                ),
-                                axis=1
-                            )
-                            mapa_obs_validade = (
-                                df_val_pedido.drop_duplicates('key')
-                                .set_index('key')['Observação']
-                                .to_dict()
-                            )
-                            df_pedido_abas['Observação'] = (
-                                df_pedido_abas['Código MV'].map(mapa_obs_validade).fillna("")
-                            )
-
-                # Coluna auxiliar para manter a coloração por status sem exibir o parecer no relatório.
-                df_pedido_abas['Status para cor'] = df_pedido_abas['Parecer Logístico / Alerta']
-
-                df_pedido_abas = df_pedido_abas.rename(columns={
-                    'Necessidade de Ressuprimento': col_pedido_label,
-                    'Saldo Atual Satélite': 'Saldo atual da Farmácia',
-                })
-
-                ordem_abas_final = [
-                    'Código MV', 'Material', 'Categoria', 'Estoque Mínimo',
-                    'Saldo atual da Farmácia', 'Cobertura (dias)', 'Δ% Tendência',
-                    col_pedido_label, 'Observação', 'Status para cor'
-                ]
-
-                larguras_pedido_abas = {
-                    **larguras_rel,
-                    'Saldo atual da Farmácia': 20,
-                    col_pedido_label: 20,
-                    'Observação': 34,
-                    'Status para cor': 26,
-                }
-
-                st.download_button(
-                    "📥 BAIXAR PEDIDO - CLASSIFICADO POR CATEGORIA (.XLSX)",
-                    data=exportar_excel_multi_aba(
-                        df_pedido_abas,
-                        ordem_abas_final,
-                        col_categoria='Categoria',
-                        col_alerta='Status para cor',
-                        larguras=larguras_pedido_abas,
-                        excluir_acoes=["Avaliar se é necessário inativar o item na farmácia."],
-                        ocultar_colunas=['Status para cor'],
-                        ajustar_altura_linhas=False,
-                    ),
-                    file_name=f"Pedido_Abas_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
-                    use_container_width=True,
-                )
-            with b3:
-                df_filtrado_export = df_filtrado[cols_exibicao]
-                st.download_button(
-                    "📥 BAIXAR RESULTADO DA ANÁLISE ATUAL - FILTRADA (.XLSX)",
-                    data=exportar_excel_padronizado(df_filtrado_export, "Filtro Atual"),
-                    file_name=f"Filtro_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
-                    use_container_width=True,
-                )
+            st.info(
+                'Esta aba permanece como central de entrada dos arquivos. Use as abas de resultado para visualizar, filtrar e exportar as análises.'
+            )
 
     else:
         st.session_state['disparar_processamento_huufma'] = False
