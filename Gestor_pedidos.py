@@ -95,6 +95,20 @@ CATEGORIAS_PADRAO = sorted([
 
 ARQUIVO_CATEGORIAS = Path(__file__).parent / "Categorias_base.xlsx"
 
+# Fonte preferencial de categorias em Google Sheets público (leitura).
+# A edição oficial deve ser feita diretamente na planilha Google;
+# Categorias_base.xlsx permanece apenas como fallback de leitura.
+USAR_GOOGLE_SHEETS_CATEGORIAS = True
+GOOGLE_SHEETS_CATEGORIAS_ID = "122sjqkGtwta8MJwhlIJYy8lm9bFuQfTXc4MoTPBT3uk"
+GOOGLE_SHEETS_CATEGORIAS_GID = "0"
+GOOGLE_SHEETS_CATEGORIAS_URL = (
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_CATEGORIAS_ID}"
+    f"/export?format=csv&gid={GOOGLE_SHEETS_CATEGORIAS_GID}"
+)
+GOOGLE_SHEETS_CATEGORIAS_LINK = (
+    f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_CATEGORIAS_ID}/edit?usp=sharing"
+)
+
 # Janela de tendência de consumo (últimos N dias com movimento)
 JANELA_TENDENCIA_DIAS = 3
 
@@ -1395,7 +1409,8 @@ def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
 def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
                               cod_farm: str, mapa_cat: dict,
                               data_ini: date, data_fim: date,
-                              dias_pedido: int) -> pd.DataFrame:
+                              dias_pedido: int,
+                              mapa_antimicrobianos: dict | None = None) -> pd.DataFrame:
     """Roda a lógica de análise completa para UMA farmácia e retorna df_final."""
     # Colunas estoque
     c_ec  = find_col(df_estoque, ['cod', 'ca3', 'ident'], forbidden=['material', 'prod'])
@@ -1459,6 +1474,8 @@ def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
     final['Farmácia']             = DIC_NOMES_FARMACIAS.get(cod_farm, f'Almox {cod_farm}')
     final['Cód. Farmácia']        = cod_farm
     final['Categoria']            = final['Código MV'].map(mapa_cat).fillna('OUTROS')
+    mapa_antimicrobianos = mapa_antimicrobianos or {}
+    final['Antimicrobianos']      = final['Código MV'].map(mapa_antimicrobianos).fillna('NÃO').apply(normalizar_antimicrobiano)
     final['Saldo Atual']          = final['Código MV'].map(est_farm).fillna(0)
     final['CMD']                  = final['Código MV'].map(consumo_map).fillna(0)
     final['Estoque Mínimo']       = final['Código MV'].map(est_min).fillna(0)
@@ -1471,22 +1488,94 @@ def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
         final.rename(columns={'Saldo Atual': 'Saldo Atual Satélite',
                                'CMD': 'Consumo Médio Diário'}))
 
-    # Parecer simplificado para consolidação
+    # Parecer simplificado para consolidação, alinhado à lógica da aba Pedido.
     def _parecer(row):
-        if row['CMD'] == 0 and row['Saldo Atual'] == 0:
+        cmd = row['CMD'] if pd.notna(row['CMD']) else 0
+        saldo = row['Saldo Atual'] if pd.notna(row['Saldo Atual']) else 0
+        est_minimo = row['Estoque Mínimo'] if pd.notna(row['Estoque Mínimo']) else 0
+        necessidade = row['Necessidade'] if pd.notna(row['Necessidade']) else 0
+        saldo_central = row['Saldo Central'] if pd.notna(row['Saldo Central']) else 0
+
+        if cmd == 0 and est_minimo <= 0 and saldo == 0:
             return 'Sem Consumo'
-        if row['CMD'] > 0 and row['Saldo Atual'] > row['CMD'] * 60:
+        if cmd > 0 and saldo > (cmd * 60):
             return 'Estoque Excessivo'
-        if row['Necessidade'] <= 0:
+        if cmd == 0 and saldo > 0:
+            return 'Estoque Parado'
+        if necessidade <= 0:
             return 'Estoque Suficiente'
-        if row['Saldo Central'] >= row['Necessidade']:
+        if saldo_central >= necessidade:
             return 'Solicitar'
-        if row['Saldo Central'] > 0:
+        if saldo_central > 0:
             return 'Estoque Crítico CAF'
         return 'Desabastecimento Crítico'
 
     final['Parecer'] = final.apply(_parecer, axis=1)
     return final
+
+def padronizar_dataframe_categorias(df: pd.DataFrame, origem: str = "") -> tuple[pd.DataFrame | None, str]:
+    """Padroniza a base de categorias vinda do Excel local ou Google Sheets.
+    Mantém a coluna Antimicrobianos para uso futuro, sem interferir na lógica atual
+    de categorias logísticas."""
+    try:
+        if df is None or df.empty:
+            return None, f"A fonte de categorias {origem or 'informada'} está vazia."
+
+        c_cod = find_col(
+            df, ['codigo', 'cod', 'ca3'],
+            forbidden=['material', 'descri', 'nome', 'produto']
+        )
+        c_mat = find_col(df, ['material', 'produto', 'insumo', 'descri', 'nome'])
+        c_cat = find_col(df, ['categoria', 'grupo', 'classe', 'tipo'])
+        c_atb = find_col(df, ['antimicrobiano', 'antimicrobianos', 'antibiotico', 'antibiótico', 'atb'])
+
+        if not c_cod or not c_cat:
+            return None, (
+                f"A fonte de categorias {origem or 'informada'} foi encontrada, "
+                "mas não foi possível identificar as colunas obrigatórias Código e Categoria."
+            )
+
+        df_clean = pd.DataFrame()
+        df_clean["Código"] = df[c_cod].apply(clean_key)
+        df_clean["Material"] = (
+            df[c_mat].fillna("").astype(str).str.strip()
+            if c_mat else ""
+        )
+        df_clean["Categoria"] = (
+            df[c_cat]
+            .fillna("OUTROS")
+            .astype(str)
+            .str.upper()
+            .str.strip()
+        )
+        if c_atb:
+            df_clean["Antimicrobianos"] = df[c_atb].apply(normalizar_antimicrobiano)
+        else:
+            df_clean["Antimicrobianos"] = "NÃO"
+
+        df_clean = df_clean[df_clean["Código"] != ""].drop_duplicates("Código", keep="last")
+        if df_clean.empty:
+            return None, f"A fonte de categorias {origem or 'informada'} não possui códigos válidos."
+
+        return df_clean.reset_index(drop=True), ""
+
+    except Exception as e:
+        return None, f"Erro ao padronizar categorias de {origem or 'fonte informada'}: {e}"
+
+
+def carregar_categorias_google_sheets_publico() -> tuple[pd.DataFrame | None, str]:
+    """Carrega categorias de uma planilha Google pública por exportação CSV.
+    Essa etapa é apenas de leitura; o salvamento direto no Google Sheets exigirá
+    autenticação própria em uma etapa futura."""
+    try:
+        df_raw = pd.read_csv(GOOGLE_SHEETS_CATEGORIAS_URL, dtype=str)
+        df_clean, erro = padronizar_dataframe_categorias(df_raw, "Google Sheets público")
+        if erro:
+            return None, erro
+        return df_clean, ""
+    except Exception as e:
+        return None, f"Erro ao carregar categorias do Google Sheets público: {e}"
+
 
 def carregar_categorias_do_disco() -> pd.DataFrame:
     if ARQUIVO_CATEGORIAS.exists():
@@ -1500,20 +1589,13 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
                 df = excel_file.parse(aba, dtype=str)
                 if df.empty:
                     continue
-                c_cod = find_col(df, ['codigo', 'cod', 'ca3'], forbidden=['material', 'descri', 'nome', 'produto'])
-                c_mat = find_col(df, ['material', 'produto', 'insumo', 'descri', 'nome'])
-                c_cat = find_col(df, ['categoria', 'grupo', 'classe', 'tipo'])
-                if c_cod and c_cat:
-                    df_clean = pd.DataFrame()
-                    df_clean["Código"]   = df[c_cod].apply(clean_key)
-                    df_clean["Material"] = df[c_mat].fillna("").astype(str).str.strip() if c_mat else ""
-                    df_clean["Categoria"] = df[c_cat].str.upper().str.strip().fillna("OUTROS")
-                    df_clean = df_clean[df_clean["Código"] != ""].drop_duplicates("Código")
-                    if not df_clean.empty:
-                        return df_clean.reset_index(drop=True)
-        except Exception:
-            pass
-    df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria"])
+                df_clean, erro = padronizar_dataframe_categorias(df, f"arquivo local / aba {aba}")
+                if df_clean is not None and not df_clean.empty:
+                    return df_clean.reset_index(drop=True)
+        except Exception as e:
+            st.session_state['categorias_erro_local'] = f"Erro ao carregar categorias locais: {e}"
+
+    df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria", "Antimicrobianos"])
     try:
         df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
     except Exception:
@@ -1521,11 +1603,41 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
     return df_vazio
 
 
+def carregar_categorias_preferencial() -> pd.DataFrame:
+    """Fonte preferencial: Google Sheets público. Fallback: arquivo local."""
+    st.session_state['categorias_erro_carga'] = ""
+    st.session_state['categorias_erro_local'] = ""
+
+    if USAR_GOOGLE_SHEETS_CATEGORIAS:
+        df_gs, erro_gs = carregar_categorias_google_sheets_publico()
+        if df_gs is not None and not df_gs.empty:
+            st.session_state['categorias_fonte'] = 'Google Sheets público'
+            st.session_state['categorias_ultima_carga'] = datetime.now().strftime('%d/%m/%Y %H:%M')
+            st.session_state['categorias_erro_carga'] = ""
+            return df_gs
+        st.session_state['categorias_erro_carga'] = erro_gs or "Google Sheets público não retornou dados válidos."
+
+    df_local = carregar_categorias_do_disco()
+    st.session_state['categorias_fonte'] = 'Arquivo local Categorias_base.xlsx'
+    st.session_state['categorias_ultima_carga'] = datetime.now().strftime('%d/%m/%Y %H:%M')
+    return df_local
+
+
 def salvar_categorias_no_disco(df: pd.DataFrame) -> bool:
     try:
-        df.to_excel(ARQUIVO_CATEGORIAS, sheet_name="Planilha1", index=False)
+        df_out = df.copy()
+        for col in ["Código", "Material", "Categoria", "Antimicrobianos"]:
+            if col not in df_out.columns:
+                df_out[col] = ""
+        cols_primeiras = ["Código", "Material", "Categoria", "Antimicrobianos"]
+        outras_cols = [c for c in df_out.columns if c not in cols_primeiras]
+        df_out = df_out[cols_primeiras + outras_cols]
+        df_out.to_excel(ARQUIVO_CATEGORIAS, sheet_name="Planilha1", index=False)
+        st.session_state['categorias_erro_salvamento'] = ""
+        st.session_state['categorias_ultimo_salvamento_local'] = datetime.now().strftime('%d/%m/%Y %H:%M')
         return True
-    except Exception:
+    except Exception as e:
+        st.session_state['categorias_erro_salvamento'] = f"Erro ao salvar categorias no arquivo local: {e}"
         st.toast(
             "⚠️ Não foi possível gravar no disco (ambiente Cloud). "
             "Use o botão 'Exportar mapa atual' para salvar suas categorias "
@@ -1537,7 +1649,7 @@ def salvar_categorias_no_disco(df: pd.DataFrame) -> bool:
 
 def inicializar_categorias_session():
     if "df_categorias" not in st.session_state:
-        st.session_state["df_categorias"] = carregar_categorias_do_disco()
+        st.session_state["df_categorias"] = carregar_categorias_preferencial()
 
 
 def obter_mapa_categorias() -> dict:
@@ -1545,6 +1657,35 @@ def obter_mapa_categorias() -> dict:
     if df.empty:
         return {}
     return dict(zip(df["Código"].astype(str), df["Categoria"].astype(str)))
+
+
+def normalizar_antimicrobiano(v) -> str:
+    """Padroniza a indicação de antimicrobiano para SIM/NÃO."""
+    if pd.isna(v):
+        return "NÃO"
+    s = clean(str(v))
+    if s in ("sim", "s", "yes", "y", "1", "true", "verdadeiro", "antimicrobiano", "antibiotico", "antibiotico sim"):
+        return "SIM"
+    if s in ("nao", "não", "n", "no", "0", "false", "falso", ""):
+        return "NÃO"
+    # Valores inesperados ficam preservados de forma conservadora como NÃO,
+    # evitando superestimar rupturas de antimicrobianos.
+    return "NÃO"
+
+
+def eh_antimicrobiano(v) -> bool:
+    return normalizar_antimicrobiano(v) == "SIM"
+
+
+def obter_mapa_antimicrobianos() -> dict:
+    df = st.session_state.get("df_categorias", pd.DataFrame())
+    if df.empty or "Antimicrobianos" not in df.columns:
+        return {}
+    tmp = df.copy()
+    tmp["Código"] = tmp["Código"].astype(str).apply(clean_key)
+    tmp["Antimicrobianos"] = tmp["Antimicrobianos"].apply(normalizar_antimicrobiano)
+    tmp = tmp[tmp["Código"] != ""].drop_duplicates("Código", keep="last")
+    return dict(zip(tmp["Código"].astype(str), tmp["Antimicrobianos"].astype(str)))
 
 
 # =============================================================================
@@ -1827,9 +1968,9 @@ def render_painel_pedido_completo() -> None:
         COL_SUG = f'Necessidade de Ressuprimento ({dias_pedido} dias)'
         ordem_cols = [
             'Código MV', 'Material', 'Categoria',
-            'Estoque Mínimo', 'Saldo Atual Satélite', 'Cobertura (dias)',
-            'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG,
-            'Tendência', 'Δ% Tendência', '⏰ Validade',
+            'Estoque Mínimo', 'Saldo Atual Satélite', '⏰ Validade',
+            'Cobertura (dias)', 'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG,
+            'Tendência', 'Δ% Tendência',
             'Saldo Almox. Centrais Unificado',
             'Parecer Logístico / Alerta', 'Ação Logística Sugerida',
         ]
@@ -1844,10 +1985,22 @@ def render_painel_pedido_completo() -> None:
             'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
         }
 
-        def _preparar_df_card(df_raw: pd.DataFrame) -> pd.DataFrame:
+        def _preparar_df_card(df_raw: pd.DataFrame, incluir_antimicrobianos: bool = False) -> pd.DataFrame:
             df = df_raw.rename(columns={'Necessidade de Ressuprimento': COL_SUG})
-            cols_ok = [c for c in ordem_cols if c in df.columns]
+            cols_base = list(ordem_cols)
+            if incluir_antimicrobianos and 'Antimicrobianos' in df.columns:
+                # No relatório de desabastecimento crítico, sinaliza se o item é antimicrobiano.
+                if 'Antimicrobianos' not in cols_base:
+                    pos = cols_base.index('Categoria') + 1 if 'Categoria' in cols_base else 0
+                    cols_base.insert(pos, 'Antimicrobianos')
+            cols_ok = [c for c in cols_base if c in df.columns]
             return df[cols_ok]
+
+        ACAO_INATIVAR_ITEM = "Avaliar se é necessário inativar o item na farmácia."
+        df_view_visual = df_view[
+            (df_view['Parecer Logístico / Alerta'] != 'Sem Consumo') &
+            (df_view['Ação Logística Sugerida'] != ACAO_INATIVAR_ITEM)
+        ].copy()
 
         # ── MÉTRICAS ─────────────────────────────────────────────────
         df_desabast = df_view[df_view['Parecer Logístico / Alerta'] == "Desabastecimento Crítico"].sort_values('Material')
@@ -1864,7 +2017,7 @@ def render_painel_pedido_completo() -> None:
                   delta_color="inverse" if datas_vazias else "normal")
         with c1:
             st.metric("🚨 Desabastecimento Crítico", f"{len(df_desabast)} itens")
-            st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_desabast), "Rupturas"),
+            st.download_button("📥 Extrair", data=exportar_excel_padronizado(_preparar_df_card(df_desabast, incluir_antimicrobianos=True), "Rupturas"),
                 file_name=f"Rupturas_{cod_farmacia_alvo}.xlsx", key="ex_c1", use_container_width=True)
         with c2:
             st.metric("🔄 Remanejamento Potencial", f"{len(df_remanej)} itens")
@@ -1885,7 +2038,7 @@ def render_painel_pedido_completo() -> None:
 
         with g1:
             st.markdown("**Saúde Geral do Estoque**")
-            df_g1 = df_view.copy()
+            df_g1 = df_view_visual.copy()
             df_g1.loc[
                 df_g1['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False),
                 'Parecer Logístico / Alerta'
@@ -1897,12 +2050,13 @@ def render_painel_pedido_completo() -> None:
                 .rename(columns={'Código MV': 'Quantidade', 'Parecer Logístico / Alerta': 'Status'})
             )
             if not df_g1_grp.empty:
+                status_g1 = [s for s in MAPA_CORES_GRAFICO.keys() if s in set(df_g1_grp['Status'])]
                 st.altair_chart(
                     alt.Chart(df_g1_grp).mark_arc(innerRadius=65, stroke='#fff').encode(
                         theta=alt.Theta('Quantidade:Q'),
                         color=alt.Color('Status:N', scale=alt.Scale(
-                            domain=list(MAPA_CORES_GRAFICO.keys()),
-                            range=list(MAPA_CORES_GRAFICO.values())
+                            domain=status_g1,
+                            range=[MAPA_CORES_GRAFICO[s] for s in status_g1]
                         ), legend=None),
                         tooltip=['Status:N', 'Quantidade:Q']
                     ).properties(height=350),
@@ -1911,7 +2065,7 @@ def render_painel_pedido_completo() -> None:
 
         with g2:
             st.markdown("**Matriz de Urgência por Categoria**")
-            df_g2 = df_view[df_view['Categoria'] != 'OUTROS'].copy()
+            df_g2 = df_view_visual[df_view_visual['Categoria'] != 'OUTROS'].copy()
             df_g2.loc[
                 df_g2['Parecer Logístico / Alerta'].str.contains("Almoxarifado", na=False),
                 'Parecer Logístico / Alerta'
@@ -1930,10 +2084,11 @@ def render_painel_pedido_completo() -> None:
                     y=alt.Y('Categoria:N', title=None)
                 )
 
+                status_g2 = [s for s in MAPA_CORES_GRAFICO.keys() if s in set(df_g2_grp['Parecer'])]
                 heatmap = base.mark_rect(cornerRadius=6, stroke='white', strokeWidth=3).encode(
                     color=alt.Color('Parecer:N', scale=alt.Scale(
-                        domain=list(MAPA_CORES_GRAFICO.keys()),
-                        range=list(MAPA_CORES_GRAFICO.values())
+                        domain=status_g2,
+                        range=[MAPA_CORES_GRAFICO[s] for s in status_g2]
                     ), legend=None),
                     opacity=alt.Opacity('Itens:Q', scale=alt.Scale(range=[0.4, 1.0]), legend=None),
                     tooltip=[
@@ -1954,11 +2109,19 @@ def render_painel_pedido_completo() -> None:
 
         # ── LEGENDA UNIFICADA (RODAPÉ) ────────────────────────────────
         st.write("")
-        legend_html = "<div style='display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 10px; background-color: #F8FAFC; border-radius: 8px; border: 1px solid #E2E8F0;'>"
-        for status, color in MAPA_CORES_GRAFICO.items():
-            legend_html += f"<div style='display: flex; align-items: center;'><div style='width: 14px; height: 14px; background-color: {color}; border-radius: 50%; margin-right: 6px;'></div><span style='font-size: 13px; color: #334155; font-weight: 500;'>{status}</span></div>"
-        legend_html += "</div>"
-        st.markdown(legend_html, unsafe_allow_html=True)
+        status_legenda = []
+        if 'df_g1_grp' in locals() and not df_g1_grp.empty:
+            status_legenda.extend(df_g1_grp['Status'].dropna().astype(str).tolist())
+        if 'df_g2_grp' in locals() and not df_g2_grp.empty:
+            status_legenda.extend(df_g2_grp['Parecer'].dropna().astype(str).tolist())
+        status_legenda = [s for s in MAPA_CORES_GRAFICO.keys() if s in set(status_legenda)]
+        if status_legenda:
+            legend_html = "<div style='display: flex; flex-wrap: wrap; justify-content: center; gap: 20px; padding: 10px; background-color: #F8FAFC; border-radius: 8px; border: 1px solid #E2E8F0;'>"
+            for status in status_legenda:
+                color = MAPA_CORES_GRAFICO[status]
+                legend_html += f"<div style='display: flex; align-items: center;'><div style='width: 14px; height: 14px; background-color: {color}; border-radius: 50%; margin-right: 6px;'></div><span style='font-size: 13px; color: #334155; font-weight: 500;'>{status}</span></div>"
+            legend_html += "</div>"
+            st.markdown(legend_html, unsafe_allow_html=True)
 
 
         # ── PAINEL INTERATIVO ─────────────────────────────────────────
@@ -1969,11 +2132,11 @@ def render_painel_pedido_completo() -> None:
             st.markdown("##### 🔍 Filtros Dinâmicos")
             f1, f2, f3 = st.columns([2, 2, 1])
             busca_nome  = f1.text_input("Filtrar por nome ou código:", value="", key="busca_nome")
-            opcoes_alertas = sorted(df_view['Parecer Logístico / Alerta'].unique().tolist())
+            opcoes_alertas = sorted(df_view_visual['Parecer Logístico / Alerta'].unique().tolist())
             busca_alerta   = f2.multiselect("Filtrar por Parecer:", options=opcoes_alertas, key="busca_alerta")
-            busca_cat      = f3.selectbox("Categoria:", ["TODAS"] + sorted(df_view['Categoria'].unique().tolist()), key="busca_cat")
+            busca_cat      = f3.selectbox("Categoria:", ["TODAS"] + sorted(df_view_visual['Categoria'].unique().tolist()), key="busca_cat")
 
-        df_filtrado = df_view.copy()
+        df_filtrado = df_view_visual.copy()
         if busca_nome:
             df_filtrado = df_filtrado[
                 df_filtrado['Material'].astype(str).str.contains(busca_nome, case=False, na=False, regex=False) |
@@ -2269,6 +2432,12 @@ with tab_remanejamentos:
         "multi-farmácia já processada e mantém as exportações completas e filtradas."
     )
 
+    st.info(
+        "⏳ Os remanejamentos são calculados a partir da consolidação multi-farmácia. "
+        "Se houver muitos itens, a avaliação pode levar alguns instantes. "
+        "Durante a análise, aguarde a finalização antes de trocar filtros ou exportar relatórios."
+    )
+
     if 'df_consolidado' not in st.session_state:
         st.warning(
             "⚠️ Gere a consolidação multi-farmácia primeiro na aba **Consolidação Multi-Farmácia**. "
@@ -2276,11 +2445,6 @@ with tab_remanejamentos:
         )
     else:
         df_cons = st.session_state['df_consolidado'].copy()
-        st.info(
-            "⏳ Os remanejamentos são calculados a partir da consolidação multi-farmácia. "
-            "Se houver muitos itens, a avaliação pode levar alguns instantes."
-        )
-
         # ── OPORTUNIDADES DE REMANEJAMENTO ────────────────────────────────
         st.write("---")
         st.markdown("#### 🔄 Oportunidades de Remanejamento Entre Farmácias")
@@ -2629,24 +2793,47 @@ with tab2:
         # Filtros
         fv1, fv2, fv3 = st.columns(3)
         ops_farm = ["TODAS"] + sorted(df_val['Nome Farmácia'].unique().tolist())
-        ops_sit  = ["TODAS"] + sorted(df_val['Situação'].unique().tolist())
+
+        mapa_sem_val = {
+            "TODAS": None,
+            "💀 Vencidos": "💀",
+            "🔴 Críticos (≤30 dias)": "🔴",
+            "🟡 Atenção (31–90 dias)": "🟡",
+            "🟢 OK (>90 dias)": "🟢",
+            "⚫ Sem data": "⚫",
+        }
+        semaforos_presentes = set(df_val.get('🚦', pd.Series(dtype=str)).dropna().astype(str).tolist())
+        ops_sit = ["TODAS"] + [rotulo for rotulo, emoji in mapa_sem_val.items()
+                                if rotulo != "TODAS" and emoji in semaforos_presentes]
+
         ops_cat  = ["TODAS"] + sorted(df_val['Categoria'].unique().tolist())
         fil_farm = fv1.selectbox("Farmácia:", ops_farm, key="val_farm")
-        fil_sit  = fv2.selectbox("Situação:", ops_sit,  key="val_sit")
+        fil_sit  = fv2.selectbox("Semáforo:", ops_sit,  key="val_sit")
         fil_cat  = fv3.selectbox("Categoria:", ops_cat, key="val_cat")
 
         df_vf = df_val.copy()
-        if fil_farm != "TODAS": df_vf = df_vf[df_vf['Nome Farmácia'] == fil_farm]
-        if fil_sit  != "TODAS": df_vf = df_vf[df_vf['Situação'] == fil_sit]
-        if fil_cat  != "TODAS": df_vf = df_vf[df_vf['Categoria'] == fil_cat]
+        if fil_farm != "TODAS":
+            df_vf = df_vf[df_vf['Nome Farmácia'] == fil_farm]
+        if fil_sit != "TODAS":
+            emoji_sit = mapa_sem_val.get(fil_sit)
+            if emoji_sit:
+                df_vf = df_vf[df_vf['🚦'] == emoji_sit]
+        if fil_cat != "TODAS":
+            df_vf = df_vf[df_vf['Categoria'] == fil_cat]
 
-        cols_exib = ['🚦', 'Situação', 'key', 'Material', 'Lote',
+        # A Categoria permanece disponível no filtro e nos relatórios, mas não polui a tabela da tela.
+        cols_tela = ['🚦', 'Situação', 'key', 'Material', 'Lote',
                      'Validade Fmt', 'Saldo AGHU', 'Saldo Planilha Validade',
-                     'Nome Farmácia', 'Categoria', 'Fonte']
-        cols_ok   = [c for c in cols_exib if c in df_vf.columns]
+                     'Nome Farmácia', 'Fonte']
+        cols_ok_tela = [c for c in cols_tela if c in df_vf.columns]
+
+        cols_export = ['🚦', 'Situação', 'key', 'Material', 'Lote',
+                       'Validade Fmt', 'Saldo AGHU', 'Saldo Planilha Validade',
+                       'Nome Farmácia', 'Categoria', 'Fonte']
+        cols_ok_export = [c for c in cols_export if c in df_vf.columns]
 
         st.dataframe(
-            df_vf[cols_ok].reset_index(drop=True),
+            df_vf[cols_ok_tela].reset_index(drop=True),
             use_container_width=True, hide_index=True,
             column_config={
                 'key':         st.column_config.TextColumn("Código MV", width="small"),
@@ -2664,13 +2851,14 @@ with tab2:
 
         # Downloads
         dv1, dv2 = st.columns(2)
-        df_criticos = df_val[df_val['Situação'].str.contains('VENCIDO|Crítico|Atenção', na=False)]
+        df_criticos = df_val[df_val['🚦'].isin(['💀', '🔴', '🟡'])].copy()
+        cols_ok_criticos = [c for c in cols_export if c in df_criticos.columns]
         with dv1:
             if not df_criticos.empty:
                 st.download_button(
                     "📥 Exportar Vencidos + Até 90 dias (.xlsx)",
                     data=exportar_excel_padronizado(
-                        df_criticos[cols_ok].reset_index(drop=True), "Ate_90_Dias"
+                        df_criticos[cols_ok_criticos].reset_index(drop=True), "Ate_90_Dias"
                     ),
                     file_name=f"Validades_Ate_90_Dias_{datetime.now().strftime('%d%m%y')}.xlsx",
                     use_container_width=True,
@@ -2679,7 +2867,7 @@ with tab2:
             st.download_button(
                 "📥 Exportar Painel Completo de Validades (.xlsx)",
                 data=exportar_excel_padronizado(
-                    df_vf[cols_ok].reset_index(drop=True), "Validades"
+                    df_vf[cols_ok_export].reset_index(drop=True), "Validades"
                 ),
                 file_name=f"Validades_Completo_{datetime.now().strftime('%d%m%y')}.xlsx",
                 use_container_width=True,
@@ -2717,6 +2905,7 @@ with tab3:
             data_fim      = st.session_state.get('data_fim_huufma', datetime.now().date() - timedelta(days=1))
             dias_ped      = st.session_state.get('dias_pedido_huufma', 15)
             mapa_cat      = obter_mapa_categorias()
+            mapa_antimicrobianos = obter_mapa_antimicrobianos()
 
             # Montar mapa cod_farmacia → df_movimento
             movs_todos = {cod_alvo: mov_alvo_raw}
@@ -2733,7 +2922,8 @@ with tab3:
                 )
                 df_res = calcular_status_farmacia(
                     est_geral_raw, movs_todos[cod], cod,
-                    mapa_cat, data_ini, data_fim, dias_ped
+                    mapa_cat, data_ini, data_fim, dias_ped,
+                    mapa_antimicrobianos
                 )
                 if not df_res.empty:
                     resultados.append(df_res)
@@ -2747,6 +2937,48 @@ with tab3:
 
         if 'df_consolidado' in st.session_state:
             df_cons = st.session_state['df_consolidado'].copy()
+            if 'Antimicrobianos' not in df_cons.columns:
+                mapa_antimicrobianos_cons = obter_mapa_antimicrobianos()
+                df_cons['Antimicrobianos'] = df_cons['Código MV'].astype(str).apply(clean_key).map(mapa_antimicrobianos_cons).fillna('NÃO')
+            df_cons['Antimicrobianos'] = df_cons['Antimicrobianos'].apply(normalizar_antimicrobiano)
+
+            # Calcula os remanejamentos potenciais com a mesma inteligência da aba
+            # Remanejamentos. O painel comparativo passa a contar oportunidades reais
+            # por farmácia destino, em vez de depender apenas do parecer simplificado
+            # da consolidação.
+            rem_potencial_por_farm = {}
+            try:
+                df_val_rem_painel = st.session_state.get('df_validades_mescladas', pd.DataFrame())
+                if (isinstance(df_val_rem_painel, pd.DataFrame) and
+                        not df_val_rem_painel.empty and
+                        'est_geral_raw' in st.session_state):
+                    df_val_rem_painel = aplicar_saldos_validades(
+                        df_val_rem_painel.copy(), st.session_state['est_geral_raw']
+                    )
+
+                with st.spinner("🔄 Atualizando indicador de remanejamento potencial..."):
+                    df_rem_potencial_painel = calcular_remanejamento_equalizado(
+                        df_cons,
+                        df_val_rem_painel,
+                        dias_cobertura=st.session_state.get('dias_pedido_huufma', 15),
+                    )
+
+                if (isinstance(df_rem_potencial_painel, pd.DataFrame) and
+                        not df_rem_potencial_painel.empty and
+                        {'Transferir PARA', 'Código MV'}.issubset(df_rem_potencial_painel.columns)):
+                    rem_potencial_por_farm = (
+                        df_rem_potencial_painel
+                        .dropna(subset=['Transferir PARA'])
+                        .groupby('Transferir PARA')['Código MV']
+                        .nunique()
+                        .to_dict()
+                    )
+            except Exception as e:
+                st.warning(
+                    "⚠️ Não foi possível atualizar o indicador de remanejamento potencial "
+                    f"no painel comparativo: {e}"
+                )
+                rem_potencial_por_farm = {}
 
             # ── KPIs POR FARMÁCIA ─────────────────────────────────────────────
             st.write("---")
@@ -2757,42 +2989,161 @@ with tab3:
                 dff = df_cons[df_cons['Cód. Farmácia'] == cod]
                 if dff.empty:
                     continue
+                dff_vis = dff[dff['Parecer'] != 'Sem Consumo'].copy()
+                dff_vis['_antimicrobiano_flag'] = dff_vis['Antimicrobianos'].apply(eh_antimicrobiano) if 'Antimicrobianos' in dff_vis.columns else False
+                mask_desab = dff_vis['Parecer'] == 'Desabastecimento Crítico'
                 painel_farms.append({
                     'Farmácia': nome,
-                    '📦 Itens': len(dff),
-                    '🔴 Rupturas': (dff['Parecer'] == 'Desabastecimento Crítico').sum(),
-                    '🔵 Solicitar': (dff['Parecer'] == 'Solicitar').sum(),
-                    '🟠 CAF Crítico': (dff['Parecer'] == 'Estoque Crítico CAF').sum(),
-                    '🟡 Remanejar': (dff['Parecer'] == 'Remanejar').sum(),
-                    '🩵 Excessos': (dff['Parecer'] == 'Estoque Excessivo').sum(),
-                    '⚫ Sem Consumo': (dff['Parecer'] == 'Sem Consumo').sum(),
+                    '📦 Itens': len(dff_vis),
+                    '🚨 Desabastecimentos Críticos': mask_desab.sum(),
+                    '🔴 Rupturas de antimicrobianos': (mask_desab & dff_vis['_antimicrobiano_flag']).sum(),
+                    '🟠 Estoque Crítico no Almoxarifado': (dff_vis['Parecer'] == 'Estoque Crítico CAF').sum(),
+                    '🔄 Remanejamento Potencial': int(rem_potencial_por_farm.get(nome, 0)),
+                    '🩵 Excessos': (dff_vis['Parecer'] == 'Estoque Excessivo').sum(),
+                    '🔘 Estoque Parado': (dff_vis['Parecer'] == 'Estoque Parado').sum(),
                 })
 
             if painel_farms:
                 df_painel = pd.DataFrame(painel_farms)
                 st.dataframe(df_painel, use_container_width=True, hide_index=True)
 
-            # ── RUPTURAS SIMULTÂNEAS ──────────────────────────────────────────
+            # ── DESABASTECIMENTOS CRÍTICOS ────────────────────────────────
             st.write("---")
-            st.markdown("#### 🚨 Itens em Desabastecimento Crítico em Múltiplas Farmácias")
-            st.caption("Sinal de desabastecimento sistêmico — não localizado numa única unidade.")
+            dias_ped_titulo = st.session_state.get('dias_pedido_huufma', 15)
+            st.markdown(
+                f"#### 🚨 Itens em Desabastecimento Crítico "
+                f"(Considerando a necessidade dos próximos {dias_ped_titulo} dias)"
+            )
+            st.caption(
+                "Lista os itens classificados como desabastecimento crítico nas farmácias analisadas, "
+                "com filtros por categoria, farmácia afetada e antimicrobianos."
+            )
 
-            df_rupt = df_cons[df_cons['Parecer'] == 'Desabastecimento Crítico']
-            conta_rupt = df_rupt.groupby('Código MV').agg(
-                Material=('Material', 'first'),
-                Categoria=('Categoria', 'first'),
-                N_Farmacias=('Farmácia', 'nunique'),
-                Farmacias=('Farmácia', lambda x: ' | '.join(sorted(x)))
-            ).reset_index().sort_values('N_Farmacias', ascending=False)
-
-            df_simult = conta_rupt[conta_rupt['N_Farmacias'] > 1]
-            if df_simult.empty:
-                st.success("✅ Nenhum item em ruptura simultânea em mais de uma farmácia.")
+            df_rupt_base = df_cons[df_cons['Parecer'] == 'Desabastecimento Crítico'].copy()
+            if df_rupt_base.empty:
+                st.success("✅ Nenhum item em desabastecimento crítico nas farmácias analisadas.")
             else:
-                st.error(f"⚠️ {len(df_simult)} item(ns) em ruptura em 2+ farmácias simultaneamente.")
-                st.dataframe(df_simult.rename(columns={
-                    'N_Farmacias': 'Nº Farmácias', 'Farmacias': 'Farmácias Afetadas'
-                }), use_container_width=True, hide_index=True)
+                df_rupt_base['Antimicrobianos'] = df_rupt_base.get('Antimicrobianos', 'NÃO')
+                df_rupt_base['Antimicrobianos'] = df_rupt_base['Antimicrobianos'].apply(normalizar_antimicrobiano)
+
+                # Estoque do item somado em TODOS os almoxarifados do arquivo de Estoque Geral.
+                # Quando o arquivo bruto não estiver disponível ou não puder ser interpretado,
+                # usa a soma dos saldos das farmácias consolidadas como fallback.
+                estoque_todos_map = {}
+                try:
+                    est_all = st.session_state.get('est_geral_raw', pd.DataFrame()).copy()
+                    c_all_cod = find_col(est_all, ['cod', 'ca3', 'ident'], forbidden=['material', 'prod'])
+                    c_all_qtd = find_col(est_all, ['qtde disp', 'disponivel'])
+                    if not est_all.empty and c_all_cod and c_all_qtd:
+                        est_all['_key_estoque_total'] = est_all[c_all_cod].apply(clean_key)
+                        est_all['_saldo_estoque_total'] = p_num_series(est_all[c_all_qtd])
+                        estoque_todos_map = (
+                            est_all[est_all['_key_estoque_total'] != '']
+                            .groupby('_key_estoque_total')['_saldo_estoque_total']
+                            .sum()
+                            .to_dict()
+                        )
+                except Exception:
+                    estoque_todos_map = {}
+
+                if not estoque_todos_map:
+                    estoque_todos_map = (
+                        df_cons.assign(_key_tmp=df_cons['Código MV'].astype(str).apply(clean_key))
+                        .groupby('_key_tmp')['Saldo Atual']
+                        .sum()
+                        .to_dict()
+                    )
+
+                # Filtros do tópico
+                fcol_cat, fcol_farm, fcol_atb = st.columns([1.3, 1.5, 1.4])
+                opcoes_cat_rupt = ["TODAS"] + sorted(df_rupt_base['Categoria'].dropna().astype(str).unique().tolist())
+                opcoes_farm_rupt = ["TODAS"] + sorted(df_rupt_base['Farmácia'].dropna().astype(str).unique().tolist())
+
+                f_cat_rupt = fcol_cat.selectbox(
+                    "Categoria:",
+                    opcoes_cat_rupt,
+                    key="filtro_rupturas_categoria",
+                )
+                f_farm_rupt = fcol_farm.selectbox(
+                    "Farmácia afetada:",
+                    opcoes_farm_rupt,
+                    key="filtro_rupturas_farmacia",
+                )
+                f_atb_rupt = fcol_atb.selectbox(
+                    "Antimicrobianos:",
+                    ["TODOS", "SOMENTE ANTIMICROBIANOS", "NÃO ANTIMICROBIANOS"],
+                    key="filtro_rupturas_antimicrobianos",
+                )
+
+                df_rupt = df_rupt_base.copy()
+                if f_cat_rupt != "TODAS":
+                    df_rupt = df_rupt[df_rupt['Categoria'].astype(str) == f_cat_rupt]
+                if f_farm_rupt != "TODAS":
+                    df_rupt = df_rupt[df_rupt['Farmácia'].astype(str) == f_farm_rupt]
+                if f_atb_rupt == "SOMENTE ANTIMICROBIANOS":
+                    df_rupt = df_rupt[df_rupt['Antimicrobianos'].apply(eh_antimicrobiano)]
+                elif f_atb_rupt == "NÃO ANTIMICROBIANOS":
+                    df_rupt = df_rupt[~df_rupt['Antimicrobianos'].apply(eh_antimicrobiano)]
+
+                if df_rupt.empty:
+                    st.info("Nenhum item em desabastecimento crítico para os filtros selecionados.")
+                else:
+                    tabela_rupt = df_rupt.groupby('Código MV').agg(
+                        ITEM=('Material', 'first'),
+                        CATEGORIA=('Categoria', 'first'),
+                        ANTIMICROBIANO=('Antimicrobianos', 'first'),
+                        **{'FARMÁCIA AFETADA': ('Farmácia', lambda x: ' | '.join(sorted(set(x.astype(str)))))}
+                    ).reset_index().rename(columns={'Código MV': 'CÓDIGO'})
+
+                    tabela_rupt['ESTOQUE EM TODOS OS ALMOXARIFADOS'] = (
+                        tabela_rupt['CÓDIGO']
+                        .astype(str)
+                        .apply(clean_key)
+                        .map(estoque_todos_map)
+                        .fillna(0)
+                        .round(0)
+                        .astype(int)
+                    )
+
+                    tabela_rupt = tabela_rupt[
+                        ['CÓDIGO', 'ITEM', 'CATEGORIA', 'ESTOQUE EM TODOS OS ALMOXARIFADOS',
+                         'ANTIMICROBIANO', 'FARMÁCIA AFETADA']
+                    ].sort_values(['ITEM', 'CÓDIGO']).reset_index(drop=True)
+
+                    filtros_aplicados = any([
+                        f_cat_rupt != "TODAS",
+                        f_farm_rupt != "TODAS",
+                        f_atb_rupt != "TODOS",
+                    ])
+                    st.error(
+                        f"⚠️ {len(tabela_rupt)} item(ns) em desabastecimento crítico "
+                        f"{'nos filtros aplicados' if filtros_aplicados else 'nas farmácias analisadas'}."
+                    )
+                    st.dataframe(tabela_rupt, use_container_width=True, hide_index=True)
+
+                    # Exportação: mantém OUTROS na visualização do aplicativo,
+                    # mas exclui essa categoria do arquivo gerado, conforme regra operacional.
+                    tabela_rupt_export = tabela_rupt[
+                        tabela_rupt['CATEGORIA'].astype(str).str.upper().str.strip() != 'OUTROS'
+                    ].copy()
+
+                    if tabela_rupt_export.empty:
+                        st.warning(
+                            "⚠️ O resultado exibido possui apenas itens da categoria OUTROS. "
+                            "Por regra, a categoria OUTROS não será incluída no relatório exportado."
+                        )
+                    else:
+                        st.download_button(
+                            "📥 Exportar desabastecimentos críticos exibidos (.xlsx)",
+                            data=exportar_excel_padronizado(
+                                tabela_rupt_export,
+                                "Desabastecimentos Críticos"
+                            ),
+                            file_name=f"Desabastecimentos_Criticos_{datetime.now().strftime('%d%m%y')}.xlsx",
+                            use_container_width=True,
+                            key="download_desabastecimentos_criticos_exibidos",
+                            help="A visualização mantém a categoria OUTROS, mas o relatório exportado exclui esses itens."
+                        )
 
             # ── REMANEJAMENTOS ────────────────────────────────────────────
             st.write("---")
@@ -2805,15 +3156,45 @@ with tab3:
             # ── VALIDADES CRÍTICAS NA CONSOLIDAÇÃO ───────────────────────────
             if 'df_validades_mescladas' in st.session_state:
                 st.write("---")
-                st.markdown("#### ⏰ Validades Críticas por Farmácia")
-                df_vc = st.session_state['df_validades_mescladas']
-                df_vc_crit = df_vc[df_vc['Situação'].str.contains('VENCIDO|Crítico', na=False)]
-                if not df_vc_crit.empty:
-                    vc_farm = df_vc_crit.groupby('Nome Farmácia')['key'].count().reset_index()
-                    vc_farm.columns = ['Farmácia', 'Itens com Validade Crítica']
-                    st.dataframe(vc_farm, use_container_width=True, hide_index=True)
+                st.markdown("#### ⏰ Validades por Farmácia — Semáforo FEFO")
+                df_vc = st.session_state['df_validades_mescladas'].copy()
+                if df_vc.empty:
+                    st.info("Nenhum dado de validade carregado para compor o semáforo.")
                 else:
-                    st.success("✅ Nenhum item com validade crítica nas farmácias.")
+                    def _classe_semaforo(situacao: str) -> str:
+                        s = str(situacao)
+                        if 'VENCIDO' in s:
+                            return '💀 Vencidos'
+                        if 'Crítico' in s:
+                            return '🔴 Críticos ≤30 dias'
+                        if 'Atenção' in s:
+                            return '🟡 Atenção 31–90 dias'
+                        if 'OK' in s:
+                            return '🟢 OK >90 dias'
+                        return '⚫ Sem data'
+
+                    ordem_sem = [
+                        '💀 Vencidos', '🔴 Críticos ≤30 dias', '🟡 Atenção 31–90 dias',
+                        '🟢 OK >90 dias', '⚫ Sem data'
+                    ]
+                    df_vc['_Semáforo'] = df_vc['Situação'].apply(_classe_semaforo)
+                    vc_farm = pd.pivot_table(
+                        df_vc,
+                        index='Nome Farmácia',
+                        columns='_Semáforo',
+                        values='key',
+                        aggfunc='count',
+                        fill_value=0,
+                    ).reset_index().rename(columns={'Nome Farmácia': 'Farmácia'})
+                    for col in ordem_sem:
+                        if col not in vc_farm.columns:
+                            vc_farm[col] = 0
+                    vc_farm = vc_farm[['Farmácia'] + ordem_sem]
+                    vc_farm = vc_farm.sort_values(
+                        ['💀 Vencidos', '🔴 Críticos ≤30 dias', '🟡 Atenção 31–90 dias', 'Farmácia'],
+                        ascending=[False, False, False, True]
+                    )
+                    st.dataframe(vc_farm, use_container_width=True, hide_index=True)
 
             # ── DOWNLOAD CONSOLIDAÇÃO ─────────────────────────────────────────
             st.write("---")
@@ -2821,12 +3202,12 @@ with tab3:
                 "📥 Exportar Consolidação Completa (.xlsx)",
                 data=exportar_excel_multi_aba(
                     df_cons,
-                    ['Código MV', 'Material', 'Categoria', 'Farmácia',
+                    ['Código MV', 'Material', 'Categoria', 'Antimicrobianos', 'Farmácia',
                      'Saldo Atual', 'CMD', 'Estoque Mínimo', 'Cobertura (dias)',
                      'Necessidade', 'Saldo Central', 'Parecer'],
                     col_categoria='Farmácia',
                     col_alerta='Parecer',
-                    larguras={'Código MV': 12, 'Material': 45, 'Categoria': 16,
+                    larguras={'Código MV': 12, 'Material': 45, 'Categoria': 16, 'Antimicrobianos': 16,
                               'Farmácia': 28, 'Saldo Atual': 14, 'CMD': 12,
                               'Estoque Mínimo': 14, 'Cobertura (dias)': 14,
                               'Necessidade': 14, 'Saldo Central': 18, 'Parecer': 28},
@@ -2842,8 +3223,59 @@ with tab3:
 with tab4:
     st.subheader("🗂️ Mapeamento Global de Categorias")
     st.info(
-        "A tabela serve como De/Para para classificar os itens no momento da análise."
+        "A tabela serve como De/Para para classificar os itens no momento da análise. "
+        "A edição oficial das categorias deve ser feita diretamente no Google Sheets."
         )
+
+    with st.container(border=True):
+        st.markdown("##### 🔗 Fonte das Categorias")
+        fonte_cat = st.session_state.get("categorias_fonte", "Não identificada")
+        ultima_carga_cat = st.session_state.get("categorias_ultima_carga", "—")
+        erro_carga_cat = st.session_state.get("categorias_erro_carga", "")
+        erro_local_cat = st.session_state.get("categorias_erro_local", "")
+        msg_cat = st.session_state.pop("categorias_msg_salvamento", "")
+
+        if fonte_cat == "Google Sheets público":
+            st.success(f"✅ Categorias carregadas do **Google Sheets público** em **{ultima_carga_cat}**.")
+        else:
+            st.warning(f"⚠️ Categorias carregadas de: **{fonte_cat}**. Última carga: **{ultima_carga_cat}**.")
+
+        if erro_carga_cat:
+            st.error(f"Erro ao carregar do Google Sheets: {erro_carga_cat}")
+        if erro_local_cat:
+            st.error(erro_local_cat)
+        if msg_cat:
+            st.info(msg_cat)
+
+        st.caption(
+            "A edição oficial das categorias deve ser feita diretamente no Google Sheets. "
+            "Depois de alterar a planilha, clique em 'Carregar categorias do Google Sheets' "
+            "para atualizar os dados usados pelo aplicativo. Se o Google Sheets falhar, "
+            "o app usa Categorias_base.xlsx apenas como fallback de leitura."
+        )
+
+        gs1, gs2, gs3 = st.columns([1, 1, 1])
+        if gs1.button("🔄 Carregar categorias do Google Sheets", use_container_width=True):
+            df_gs, erro_gs = carregar_categorias_google_sheets_publico()
+            if df_gs is not None and not df_gs.empty:
+                st.session_state["df_categorias"] = df_gs
+                st.session_state["categorias_fonte"] = "Google Sheets público"
+                st.session_state["categorias_ultima_carga"] = datetime.now().strftime('%d/%m/%Y %H:%M')
+                st.session_state["categorias_erro_carga"] = ""
+                st.session_state["categorias_msg_salvamento"] = "✅ Categorias carregadas novamente do Google Sheets público."
+                st.rerun()
+            else:
+                st.session_state["categorias_erro_carga"] = erro_gs or "Google Sheets público não retornou dados válidos."
+                st.rerun()
+
+        if gs2.button("🧪 Testar conexão", use_container_width=True):
+            df_gs, erro_gs = carregar_categorias_google_sheets_publico()
+            if df_gs is not None:
+                st.success(f"✅ Conexão OK. {len(df_gs)} categoria(s) encontradas no Google Sheets.")
+            else:
+                st.error(erro_gs or "Falha não especificada ao testar o Google Sheets.")
+
+        gs3.markdown(f"[🔗 Abrir planilha Google]({GOOGLE_SHEETS_CATEGORIAS_LINK})")
 
     df_cat_atual = st.session_state["df_categorias"].copy()
     lista_grupos_reais = sorted(df_cat_atual["Categoria"].unique().tolist()) \
@@ -2876,48 +3308,39 @@ with tab4:
             df_filtrado_cat = df_filtrado_cat[df_filtrado_cat["Categoria"] == filtro_sel_cat]
 
         st.markdown(f"##### 📋 Itens Encontrados ({len(df_filtrado_cat)} registros)")
-
-        df_editor_output = st.data_editor(
-            df_filtrado_cat.reset_index(drop=True),
-            use_container_width=True, hide_index=True, num_rows="dynamic",
-            column_config={
-                "Código":    st.column_config.TextColumn("Código MV", required=True, width="small"),
-                "Material":  st.column_config.TextColumn("Descrição do Insumo", required=True, width="large"),
-                "Categoria": st.column_config.SelectboxColumn(
-                    "Categoria Logística", options=lista_grupos_reais, required=True, width="medium"
-                ),
-            },
-            key="editor_categorias",
+        st.caption(
+            "Visualização somente leitura. Para corrigir Código, Material, Categoria ou Antimicrobianos, "
+            "edite diretamente a planilha Google e depois clique em 'Carregar categorias do Google Sheets'."
         )
 
-        col_salvar, col_reset = st.columns([4, 1])
-        if col_salvar.button("💾 SALVAR ALTERAÇÕES PERMANENTEMENTE", use_container_width=True):
-            codigos_visiveis = set(df_filtrado_cat["Código"].astype(str).tolist())
-            df_base = st.session_state["df_categorias"].copy()
-            df_base_limpo = df_base[~df_base["Código"].astype(str).isin(codigos_visiveis)]
-            df_novo = pd.concat([df_base_limpo, df_editor_output], ignore_index=True)
-            df_novo = df_novo.drop_duplicates("Código", keep="last")
-            df_novo = df_novo[df_novo["Código"].astype(str).str.strip() != ""]
-            st.session_state["df_categorias"] = df_novo.reset_index(drop=True)
-            if salvar_categorias_no_disco(st.session_state["df_categorias"]):
-                st.success("✅ Alterações salvas em 'Categorias_base.xlsx'.")
-                st.rerun()
+        cols_cat_exibir = [c for c in ["Código", "Material", "Categoria", "Antimicrobianos"] if c in df_filtrado_cat.columns]
+        st.dataframe(
+            df_filtrado_cat[cols_cat_exibir].reset_index(drop=True),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Código": st.column_config.TextColumn("Código MV", width="small"),
+                "Material": st.column_config.TextColumn("Descrição do Insumo", width="large"),
+                "Categoria": st.column_config.TextColumn("Categoria Logística", width="medium"),
+                "Antimicrobianos": st.column_config.TextColumn(
+                    "Antimicrobianos", width="small",
+                    help="Campo preservado para futuras análises de antimicrobianos. Sugestão: SIM ou NÃO."
+                ),
+            }
+        )
 
-        if col_reset.button("🔄 Cancelar", use_container_width=True):
-            st.session_state.pop("df_categorias", None)
-            st.rerun()
-
-        # Download de itens OUTROS para classificação em lote
+        # Download de itens OUTROS para classificação em lote / revisão na planilha Google
         df_outros = df_cat_atual[df_cat_atual["Categoria"] == "OUTROS"]
         if not df_outros.empty:
             st.download_button(
-                "📥 Exportar itens OUTROS para classificação em lote",
-                data=exportar_excel_padronizado(df_outros, "Para Classificar"),
+                "📥 Exportar itens OUTROS para revisão no Google Sheets",
+                data=exportar_excel_padronizado(df_outros, "Para Revisar"),
                 file_name=f"Itens_OUTROS_{datetime.now().strftime('%d%m%y')}.xlsx",
                 use_container_width=True,
+                help="Use este arquivo como apoio para revisar a planilha Google. A edição oficial deve ser feita no Sheets."
             )
     else:
-        st.warning("🔍 Utilize os filtros acima para visualizar e editar os registros.")
+        st.warning("🔍 Utilize os filtros acima para visualizar os registros.")
+        st.info("Para alterar categorias, abra a planilha Google, edite os dados e recarregue as categorias no aplicativo.")
 
     # Botão exportar mapa completo — sempre disponível, fora do if/else
     st.write("")
@@ -2928,8 +3351,7 @@ with tab4:
             data=exportar_excel_padronizado(df_completo_export, "Categorias"),
             file_name=f"Categorias_base_{datetime.now().strftime('%d%m%y')}.xlsx",
             use_container_width=True,
-            help="Baixe este arquivo e guarde no repositório como 'Categorias_base.xlsx' "
-                 "para que as categorias sejam carregadas automaticamente na próxima sessão."
+            help="Backup da base atualmente carregada. A edição oficial deve ser realizada no Google Sheets."
         )
 
 
@@ -3311,7 +3733,9 @@ with tab1:
                 )
 
                 mapa_cat = obter_mapa_categorias()
+                mapa_antimicrobianos = obter_mapa_antimicrobianos()
                 final['Categoria'] = final['Código MV'].map(mapa_cat).fillna('OUTROS')
+                final['Antimicrobianos'] = final['Código MV'].map(mapa_antimicrobianos).fillna('NÃO').apply(normalizar_antimicrobiano)
 
                 total_itens   = len(final)
                 itens_mapeados = final['Categoria'].ne('OUTROS').sum()
@@ -3396,4 +3820,19 @@ with tab1:
 
     else:
         st.session_state['disparar_processamento_huufma'] = False
-        st.warning("⚠️ Aguardando upload dos arquivos obrigatórios para iniciar o processamento.")
+        if 'df_final_huufma' in st.session_state:
+            st.success(
+                '✅ Dados já processados nesta sessão. A análise operacional completa está disponível na aba **📦 Pedido da Farmácia Ativa**.'
+            )
+            st.info(
+                'Para processar uma nova extração do AGHU, carregue novamente o movimento da farmácia alvo e o estoque geral. '
+                'Recarregar categorias do Google Sheets não apaga a análise já processada.'
+            )
+        elif 'est_geral_raw' in st.session_state and 'mov_alvo_raw' in st.session_state:
+            st.info(
+                'ℹ️ Arquivos obrigatórios já foram lidos nesta sessão, mas a análise final ainda não está disponível. '
+                'Clique em **ANALISAR OS DADOS COM INTELIGÊNCIA LOGÍSTICA** se os arquivos ainda estiverem anexados, '
+                'ou carregue-os novamente para reprocessar.'
+            )
+        else:
+            st.warning("⚠️ Aguardando upload dos arquivos obrigatórios para iniciar o processamento.")
