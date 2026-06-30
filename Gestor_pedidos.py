@@ -122,6 +122,13 @@ SS_SHAREPOINT_URL = 'sharepoint_validades_url'
 # Farmácias satélites (códigos de almoxarifado)
 CODIGOS_FARMACIAS = ['7', '13', '31', '34', '39']
 
+# Almoxarifados que devem ser ignorados em toda a lógica do aplicativo.
+# O almoxarifado 45 contém medicamentos vinculados a pacientes, fora da gestão
+# operacional da UDIS/farmácias satélites para pedidos, remanejamentos, validade
+# e consolidação de estoque.
+CODIGOS_ALMOXARIFADOS_EXCLUIR = {'45'}
+DIC_ALMOXARIFADOS_EXCLUIDOS = {'45': 'Almoxarifado 45 - estoque de pacientes'}
+
 
 # =============================================================================
 # FUNÇÕES UTILITÁRIAS
@@ -151,6 +158,33 @@ def clean(t: str) -> str:
 
 def clean_key(v) -> str:
     return re.sub(r'[^0-9]', '', str(v)).lstrip('0')
+
+
+def almoxarifado_excluido(v) -> bool:
+    """Indica se o código de almoxarifado deve ser ignorado pelo app."""
+    return clean_key(v) in CODIGOS_ALMOXARIFADOS_EXCLUIR
+
+
+def filtrar_almoxarifados_excluidos(df: pd.DataFrame, col_almox: str | None = None) -> pd.DataFrame:
+    """Remove linhas de almoxarifados fora da gestão do aplicativo.
+
+    A regra é aplicada de forma centralizada para evitar que o almoxarifado 45
+    influencie saldos, validades, consumo, consolidação, remanejamentos ou
+    relatórios. Se a coluna de almoxarifado não for encontrada, retorna cópia
+    do dataframe sem alteração para não quebrar fluxos que não possuem essa coluna.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        return df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
+    if col_almox is None:
+        col_almox = find_col(df, ['almox'])
+
+    if not col_almox or col_almox not in df.columns:
+        return df.copy()
+
+    out = df.copy()
+    mask_excluir = out[col_almox].apply(clean_key).isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)
+    return out.loc[~mask_excluir].copy()
 
 
 def p_num(v) -> float:
@@ -324,8 +358,26 @@ def _aplicar_estilo_aba(ws, wb, df: pd.DataFrame, col_alerta: str,
         })
 
 
+def normalizar_nome_aba_excel(nome_aba: str = "Dados") -> str:
+    """Garante nome de aba compatível com Excel/XlsxWriter.
+
+    Regras do Excel:
+    - máximo de 31 caracteres;
+    - não permite os caracteres especiais bloqueados pelo Excel;
+    - não pode ficar vazio.
+    """
+    nome = str(nome_aba or "Dados").strip()
+    for ch in ['[', ']', ':', '*', '?', '/', '\\']:
+        nome = nome.replace(ch, '-')
+    nome = nome.replace("'", "").strip()
+    if not nome:
+        nome = "Dados"
+    return nome[:31]
+
+
 def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") -> bytes:
     buf = io.BytesIO()
+    nome_aba = normalizar_nome_aba_excel(nome_aba)
     with pd.ExcelWriter(buf, engine='xlsxwriter') as wr:
         df_dados.to_excel(wr, sheet_name=nome_aba, index=False)
         wb = wr.book
@@ -388,7 +440,7 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
             if df_exp.empty:
                 continue
 
-            nome_aba = str(cat)[:31]
+            nome_aba = normalizar_nome_aba_excel(cat)
             df_exp.to_excel(writer, sheet_name=nome_aba, index=False)
             ws = writer.sheets[nome_aba]
 
@@ -520,6 +572,10 @@ def extrair_saldos_estoque_geral(est_geral: pd.DataFrame) -> pd.DataFrame:
     est['Farmácia'] = est[c_alm].apply(clean_key)
     est['Saldo AGHU'] = p_num_series(est[c_qtd])
 
+    # Regra global: o almoxarifado 45 representa estoque de pacientes e não deve
+    # compor saldo AGHU, validade, pedido ou remanejamento.
+    est = est[~est['Farmácia'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)]
+
     est = est[(est['key'] != '') & (est['Farmácia'] != '')]
     if est.empty:
         return pd.DataFrame(columns=['key', 'Farmácia', 'Saldo AGHU'])
@@ -547,6 +603,9 @@ def aplicar_saldos_validades(df_val: pd.DataFrame, est_geral_raw: pd.DataFrame |
         return df_val
 
     df = df_val.copy()
+    if 'Farmácia' in df.columns:
+        df['Farmácia'] = df['Farmácia'].apply(clean_key)
+        df = df[~df['Farmácia'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
 
     # Compatibilidade com versões anteriores: a quantidade da planilha era chamada
     # de Qtd Controle Validade. Agora ela fica visível como Saldo Planilha Validade.
@@ -727,6 +786,10 @@ def normalizar_planilha_validades(df: pd.DataFrame) -> pd.DataFrame:
     out['Saldo Planilha Validade'] = p_num_series(df[c_qtd]) if c_qtd else np.nan
     # Mantém o nome antigo apenas por compatibilidade interna, se alguma sessão antiga reutilizar o dado.
     out['Qtd Controle Validade'] = out['Saldo Planilha Validade']
+
+    # Regra global: remover almoxarifados fora da gestão do aplicativo.
+    out = out[~out['Farmácia'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)]
+
     return out[out['key'] != ''].dropna(subset=['Validade']).reset_index(drop=True)
 
 
@@ -749,6 +812,9 @@ def extrair_validades_aghu(est_geral: pd.DataFrame) -> pd.DataFrame:
     out['Validade'] = pd.to_datetime(df[c_val], dayfirst=True, errors='coerce') if c_val else pd.NaT
     out['Farmácia'] = df[c_alm].apply(clean_key) if c_alm else ''
     out['Fonte']    = 'AGHU'
+
+    # Regra global: remover almoxarifados fora da gestão do aplicativo.
+    out = out[~out['Farmácia'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)]
 
     # Só retorna linhas com lote ou validade efetivamente preenchidos
     mask = out['Lote'].ne('') | out['Validade'].notna()
@@ -902,6 +968,7 @@ def calcular_remanejamento_preventivo_validade(
     dfv = df_validades.copy()
     dfv['key'] = dfv['key'].apply(clean_key)
     dfv['Farmácia'] = dfv['Farmácia'].apply(clean_key)
+    dfv = dfv[~dfv['Farmácia'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
     dfv['Validade'] = pd.to_datetime(dfv['Validade'], errors='coerce', dayfirst=True)
 
     if 'Dias até Vencer' not in dfv.columns:
@@ -943,6 +1010,7 @@ def calcular_remanejamento_preventivo_validade(
     dfc = df_cons.copy()
     dfc['key'] = dfc['Código MV'].apply(clean_key)
     dfc['cod_farm'] = dfc['Cód. Farmácia'].apply(clean_key)
+    dfc = dfc[~dfc['cod_farm'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
     dfc['CMD'] = pd.to_numeric(dfc['CMD'], errors='coerce').fillna(0)
     dfc['Saldo Atual'] = pd.to_numeric(dfc['Saldo Atual'], errors='coerce').fillna(0)
     if 'Necessidade' not in dfc.columns:
@@ -1110,6 +1178,9 @@ def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
     df = df_cons.copy()
     df['key'] = df['Código MV'].apply(clean_key)
     df['cod_farm'] = df['Cód. Farmácia'].apply(clean_key)
+    df = df[~df['cod_farm'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
+    if df.empty:
+        return pd.DataFrame()
     df['Saldo Atual'] = (
         pd.to_numeric(df['Saldo Atual'], errors='coerce')
         .replace([np.inf, -np.inf], 0).fillna(0).clip(lower=0)
@@ -1162,6 +1233,7 @@ def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
         if {'key', 'Farmácia'}.issubset(dfv.columns):
             dfv['key'] = dfv['key'].apply(clean_key)
             dfv['Farmácia'] = dfv['Farmácia'].apply(clean_key)
+            dfv = dfv[~dfv['Farmácia'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
             if 'Dias até Vencer' in dfv.columns:
                 dias = pd.to_numeric(dfv['Dias até Vencer'], errors='coerce')
                 mask = dias.between(0, VALIDADE_ATENCAO_DIAS, inclusive='both')
@@ -1426,6 +1498,7 @@ def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
     est['almox_limpo'] = est[c_ea].apply(clean_key)
     est['saldo_num']   = p_num_series(est[c_eq])
     est['min_num']     = p_num_series(est[c_em]) if c_em else 0.0
+    est = est[~est['almox_limpo'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
 
     _alvo = (est[est['almox_limpo'] == cod_farm]
              .groupby('key')
@@ -1452,10 +1525,11 @@ def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
     c_mt = find_col(df_mov, ['tipo'])
     c_md = find_col(df_mov, ['data geracao','data mov','data','dt ger','dtger'],
                     forbidden=['almox','tipo','quant','material'])
+    c_ma = find_col(df_mov, ['almox'])
     if not all([c_mc, c_mq, c_mt, c_md]):
         return pd.DataFrame()
 
-    mov = df_mov.copy()
+    mov = filtrar_almoxarifados_excluidos(df_mov, c_ma) if c_ma else df_mov.copy()
     mov['dt_fmt'] = pd.to_datetime(mov[c_md], dayfirst=False, errors='coerce')
     mov_f = mov[(mov['dt_fmt'].dt.date >= data_ini) &
                 (mov['dt_fmt'].dt.date <= data_fim) &
@@ -2947,6 +3021,8 @@ with tab3:
             # por farmácia destino, em vez de depender apenas do parecer simplificado
             # da consolidação.
             rem_potencial_por_farm = {}
+            df_rem_potencial_painel = pd.DataFrame()
+            remanejamento_qtd_por_item_farm = {}
             try:
                 df_val_rem_painel = st.session_state.get('df_validades_mescladas', pd.DataFrame())
                 if (isinstance(df_val_rem_painel, pd.DataFrame) and
@@ -2973,12 +3049,68 @@ with tab3:
                         .nunique()
                         .to_dict()
                     )
+
+                    # Mapa item + farmácia destino -> quantidade total remanejável sugerida.
+                    # Esse mapa permite diferenciar necessidade crítica local de
+                    # desabastecimento crítico real na consolidação. Se a necessidade
+                    # da farmácia puder ser coberta por remanejamento interno suficiente,
+                    # o item não deve permanecer no bloco de desabastecimento crítico real.
+                    if 'Quantidade sugerida remanejar' in df_rem_potencial_painel.columns:
+                        df_qtd_rem = df_rem_potencial_painel.copy()
+                        df_qtd_rem['_key_rem_dest'] = df_qtd_rem['Código MV'].astype(str).apply(clean_key)
+                        df_qtd_rem['_farm_dest'] = df_qtd_rem['Transferir PARA'].astype(str)
+                        df_qtd_rem['_qtd_rem_dest'] = (
+                            pd.to_numeric(df_qtd_rem['Quantidade sugerida remanejar'], errors='coerce')
+                            .replace([np.inf, -np.inf], 0)
+                            .fillna(0)
+                            .clip(lower=0)
+                        )
+                        remanejamento_qtd_por_item_farm = (
+                            df_qtd_rem[df_qtd_rem['_key_rem_dest'] != '']
+                            .groupby(['_key_rem_dest', '_farm_dest'])['_qtd_rem_dest']
+                            .sum()
+                            .to_dict()
+                        )
             except Exception as e:
                 st.warning(
                     "⚠️ Não foi possível atualizar o indicador de remanejamento potencial "
                     f"no painel comparativo: {e}"
                 )
                 rem_potencial_por_farm = {}
+
+            # Define desabastecimento crítico REAL na consolidação.
+            # Regra: permanece crítico somente quando há necessidade na farmácia,
+            # sem atendimento central suficiente e sem remanejamento interno suficiente.
+            # A quantidade remanejável vem da mesma lógica da aba Remanejamentos.
+            try:
+                if 'Necessidade' not in df_cons.columns:
+                    df_cons['Necessidade'] = 0
+                df_cons['_key_critico_real'] = df_cons['Código MV'].astype(str).apply(clean_key)
+                df_cons['_qtd_remanejamento_destino'] = df_cons.apply(
+                    lambda r: float(remanejamento_qtd_por_item_farm.get(
+                        (r['_key_critico_real'], str(r.get('Farmácia', ''))), 0
+                    )),
+                    axis=1
+                )
+                df_cons['_necessidade_num'] = (
+                    pd.to_numeric(df_cons['Necessidade'], errors='coerce')
+                    .replace([np.inf, -np.inf], 0)
+                    .fillna(0)
+                    .clip(lower=0)
+                )
+                df_cons['_Necessidade Residual Crítica'] = np.where(
+                    df_cons['Parecer'].astype(str) == 'Desabastecimento Crítico',
+                    np.maximum(df_cons['_necessidade_num'] - df_cons['_qtd_remanejamento_destino'], 0),
+                    0
+                )
+                df_cons['_Desabastecimento Crítico Real'] = (
+                    (df_cons['Parecer'].astype(str) == 'Desabastecimento Crítico') &
+                    (df_cons['_Necessidade Residual Crítica'] > 0)
+                )
+            except Exception:
+                df_cons['_qtd_remanejamento_destino'] = 0
+                df_cons['_Necessidade Residual Crítica'] = 0
+                df_cons['_Desabastecimento Crítico Real'] = df_cons['Parecer'].astype(str) == 'Desabastecimento Crítico'
 
             # ── KPIs POR FARMÁCIA ─────────────────────────────────────────────
             st.write("---")
@@ -2991,7 +3123,10 @@ with tab3:
                     continue
                 dff_vis = dff[dff['Parecer'] != 'Sem Consumo'].copy()
                 dff_vis['_antimicrobiano_flag'] = dff_vis['Antimicrobianos'].apply(eh_antimicrobiano) if 'Antimicrobianos' in dff_vis.columns else False
-                mask_desab = dff_vis['Parecer'] == 'Desabastecimento Crítico'
+                if '_Desabastecimento Crítico Real' in dff_vis.columns:
+                    mask_desab = dff_vis['_Desabastecimento Crítico Real'].fillna(False).astype(bool)
+                else:
+                    mask_desab = dff_vis['Parecer'] == 'Desabastecimento Crítico'
                 painel_farms.append({
                     'Farmácia': nome,
                     '📦 Itens': len(dff_vis),
@@ -3015,13 +3150,25 @@ with tab3:
                 f"(Considerando a necessidade dos próximos {dias_ped_titulo} dias)"
             )
             st.caption(
-                "Lista os itens classificados como desabastecimento crítico nas farmácias analisadas, "
-                "com filtros por categoria, farmácia afetada e antimicrobianos."
+                "Lista apenas os itens com necessidade residual crítica: sem atendimento suficiente pelos "
+                "almoxarifados centrais e sem remanejamento interno suficiente identificado. "
+                "Itens resolvíveis por remanejamento saem deste bloco e permanecem na aba Remanejamentos."
             )
 
-            df_rupt_base = df_cons[df_cons['Parecer'] == 'Desabastecimento Crítico'].copy()
+            if '_Desabastecimento Crítico Real' in df_cons.columns:
+                total_critico_local = int((df_cons['Parecer'].astype(str) == 'Desabastecimento Crítico').sum())
+                total_critico_real = int(df_cons['_Desabastecimento Crítico Real'].fillna(False).astype(bool).sum())
+                total_resolvido_rem = max(total_critico_local - total_critico_real, 0)
+                if total_resolvido_rem > 0:
+                    st.info(
+                        f"ℹ️ {total_resolvido_rem} ocorrência(s) de necessidade crítica local foram retiradas deste bloco "
+                        "por possuírem remanejamento interno suficiente identificado."
+                    )
+                df_rupt_base = df_cons[df_cons['_Desabastecimento Crítico Real'].fillna(False).astype(bool)].copy()
+            else:
+                df_rupt_base = df_cons[df_cons['Parecer'] == 'Desabastecimento Crítico'].copy()
             if df_rupt_base.empty:
-                st.success("✅ Nenhum item em desabastecimento crítico nas farmácias analisadas.")
+                st.success("✅ Nenhum item em desabastecimento crítico real nas farmácias analisadas.")
             else:
                 df_rupt_base['Antimicrobianos'] = df_rupt_base.get('Antimicrobianos', 'NÃO')
                 df_rupt_base['Antimicrobianos'] = df_rupt_base['Antimicrobianos'].apply(normalizar_antimicrobiano)
@@ -3034,6 +3181,9 @@ with tab3:
                     est_all = st.session_state.get('est_geral_raw', pd.DataFrame()).copy()
                     c_all_cod = find_col(est_all, ['cod', 'ca3', 'ident'], forbidden=['material', 'prod'])
                     c_all_qtd = find_col(est_all, ['qtde disp', 'disponivel'])
+                    c_all_alm = find_col(est_all, ['almox'])
+                    if c_all_alm:
+                        est_all = filtrar_almoxarifados_excluidos(est_all, c_all_alm)
                     if not est_all.empty and c_all_cod and c_all_qtd:
                         est_all['_key_estoque_total'] = est_all[c_all_cod].apply(clean_key)
                         est_all['_saldo_estoque_total'] = p_num_series(est_all[c_all_qtd])
@@ -3053,6 +3203,25 @@ with tab3:
                         .sum()
                         .to_dict()
                     )
+
+                # CMD geral do item: soma do CMD das farmácias analisadas.
+                # Não é média simples das farmácias; representa o consumo médio diário
+                # hospitalar estimado para o item no conjunto de farmácias consolidadas.
+                try:
+                    if 'CMD' in df_cons.columns:
+                        df_cmd_geral = df_cons.copy()
+                        df_cmd_geral['_key_cmd_geral'] = df_cmd_geral['Código MV'].astype(str).apply(clean_key)
+                        df_cmd_geral['_cmd_num'] = pd.to_numeric(df_cmd_geral['CMD'], errors='coerce').replace([np.inf, -np.inf], np.nan).fillna(0)
+                        cmd_geral_map = (
+                            df_cmd_geral[df_cmd_geral['_key_cmd_geral'] != '']
+                            .groupby('_key_cmd_geral')['_cmd_num']
+                            .sum()
+                            .to_dict()
+                        )
+                    else:
+                        cmd_geral_map = {}
+                except Exception:
+                    cmd_geral_map = {}
 
                 # Filtros do tópico
                 fcol_cat, fcol_farm, fcol_atb = st.columns([1.3, 1.5, 1.4])
@@ -3086,7 +3255,7 @@ with tab3:
                     df_rupt = df_rupt[~df_rupt['Antimicrobianos'].apply(eh_antimicrobiano)]
 
                 if df_rupt.empty:
-                    st.info("Nenhum item em desabastecimento crítico para os filtros selecionados.")
+                    st.info("Nenhum item em desabastecimento crítico real para os filtros selecionados.")
                 else:
                     tabela_rupt = df_rupt.groupby('Código MV').agg(
                         ITEM=('Material', 'first'),
@@ -3105,8 +3274,29 @@ with tab3:
                         .astype(int)
                     )
 
+                    tabela_rupt['CMD GERAL'] = (
+                        tabela_rupt['CÓDIGO']
+                        .astype(str)
+                        .apply(clean_key)
+                        .map(cmd_geral_map)
+                        .fillna(0)
+                        .astype(float)
+                    )
+                    tabela_rupt['COBERTURA GERAL ESTIMADA (DIAS)'] = np.where(
+                        tabela_rupt['CMD GERAL'] > 0,
+                        tabela_rupt['ESTOQUE EM TODOS OS ALMOXARIFADOS'] / tabela_rupt['CMD GERAL'],
+                        np.nan
+                    )
+                    tabela_rupt['CMD GERAL'] = tabela_rupt['CMD GERAL'].round(2)
+                    tabela_rupt['COBERTURA GERAL ESTIMADA (DIAS)'] = (
+                        pd.to_numeric(tabela_rupt['COBERTURA GERAL ESTIMADA (DIAS)'], errors='coerce')
+                        .replace([np.inf, -np.inf], np.nan)
+                        .round(1)
+                    )
+
                     tabela_rupt = tabela_rupt[
                         ['CÓDIGO', 'ITEM', 'CATEGORIA', 'ESTOQUE EM TODOS OS ALMOXARIFADOS',
+                         'CMD GERAL', 'COBERTURA GERAL ESTIMADA (DIAS)',
                          'ANTIMICROBIANO', 'FARMÁCIA AFETADA']
                     ].sort_values(['ITEM', 'CÓDIGO']).reset_index(drop=True)
 
@@ -3116,10 +3306,29 @@ with tab3:
                         f_atb_rupt != "TODOS",
                     ])
                     st.error(
-                        f"⚠️ {len(tabela_rupt)} item(ns) em desabastecimento crítico "
+                        f"⚠️ {len(tabela_rupt)} item(ns) em desabastecimento crítico real "
                         f"{'nos filtros aplicados' if filtros_aplicados else 'nas farmácias analisadas'}."
                     )
-                    st.dataframe(tabela_rupt, use_container_width=True, hide_index=True)
+                    st.dataframe(
+                        tabela_rupt,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            'ESTOQUE EM TODOS OS ALMOXARIFADOS': st.column_config.NumberColumn(
+                                'ESTOQUE EM TODOS OS ALMOXARIFADOS', format='%d'
+                            ),
+                            'CMD GERAL': st.column_config.NumberColumn(
+                                'CMD GERAL',
+                                help='Soma do CMD das farmácias analisadas para o item.',
+                                format='%.2f'
+                            ),
+                            'COBERTURA GERAL ESTIMADA (DIAS)': st.column_config.NumberColumn(
+                                'COBERTURA GERAL ESTIMADA (DIAS)',
+                                help='Estoque em todos os almoxarifados dividido pelo CMD geral.',
+                                format='%.1f'
+                            ),
+                        }
+                    )
 
                     # Exportação: mantém OUTROS na visualização do aplicativo,
                     # mas exclui essa categoria do arquivo gerado, conforme regra operacional.
@@ -3134,12 +3343,12 @@ with tab3:
                         )
                     else:
                         st.download_button(
-                            "📥 Exportar desabastecimentos críticos exibidos (.xlsx)",
+                            "📥 Exportar desabastecimentos críticos reais exibidos (.xlsx)",
                             data=exportar_excel_padronizado(
                                 tabela_rupt_export,
-                                "Desabastecimentos Críticos"
+                                "Desabastecimentos Críticos Reais"
                             ),
-                            file_name=f"Desabastecimentos_Criticos_{datetime.now().strftime('%d%m%y')}.xlsx",
+                            file_name=f"Desabastecimentos_Criticos_Reais_{datetime.now().strftime('%d%m%y')}.xlsx",
                             use_container_width=True,
                             key="download_desabastecimentos_criticos_exibidos",
                             help="A visualização mantém a categoria OUTROS, mas o relatório exportado exclui esses itens."
@@ -3513,6 +3722,22 @@ with tab1:
                 c_est_almox = cols_est['almoxarifado']
                 c_est_min   = cols_est['mínimo']
 
+                # Regra global: excluir o almoxarifado 45 antes de qualquer cálculo.
+                # Ele contém estoque vinculado a pacientes e não deve influenciar pedido,
+                # consumo, validade, consolidação, remanejamentos ou relatórios.
+                mov = filtrar_almoxarifados_excluidos(mov, c_mov_almox)
+                est_geral = filtrar_almoxarifados_excluidos(est_geral, c_est_almox)
+                st.session_state['est_geral_raw'] = est_geral
+                st.session_state['mov_alvo_raw'] = mov
+
+                if mov.empty:
+                    st.error(
+                        "❌ O arquivo de movimento ficou vazio após excluir almoxarifados fora da gestão do app "
+                        "(ex.: Almoxarifado 45 - estoque de pacientes). Verifique se o arquivo enviado é de uma farmácia gerenciada."
+                    )
+                    st.session_state['disparar_processamento_huufma'] = False
+                    st.stop()
+
                 # --- TRAVA INTELIGENTE: DETECÇÃO AUTOMÁTICA DA FARMÁCIA ALVO ---
                 codigos_almox = mov[c_mov_almox].dropna().astype(str).apply(clean_key)
                 modas_almox = codigos_almox[codigos_almox != ""].mode()
@@ -3524,6 +3749,13 @@ with tab1:
                     st.session_state['disparar_processamento_huufma'] = False
                     st.stop()
                 cod_farmacia_alvo = modas_almox[0]
+                if almoxarifado_excluido(cod_farmacia_alvo):
+                    st.error(
+                        "❌ O almoxarifado detectado é o 45, que contém estoque de pacientes e foi excluído da lógica do aplicativo. "
+                        "Envie o movimento de uma farmácia/almoxarifado gerenciado pela UDIS."
+                    )
+                    st.session_state['disparar_processamento_huufma'] = False
+                    st.stop()
                 
                 st.session_state['cod_farmacia_alvo'] = cod_farmacia_alvo
                 st.session_state['nome_farmacia_alvo'] = DIC_NOMES_FARMACIAS.get(cod_farmacia_alvo, f"Almoxarifado (Cód. {cod_farmacia_alvo})")
@@ -3535,6 +3767,7 @@ with tab1:
                 est_geral['almox_limpo'] = est_geral[c_est_almox].apply(clean_key)
                 est_geral['saldo_num']   = p_num_series(est_geral[c_est_qtd])
                 est_geral['min_num']     = p_num_series(est_geral[c_est_min]) if c_est_min else 0.0
+                est_geral = est_geral[~est_geral['almox_limpo'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
 
                 # Saldo: soma das linhas. Mínimo: parâmetro único por item — usar max
                 # evita duplicar o mínimo quando o item aparece em mais de uma linha.
@@ -3661,6 +3894,8 @@ with tab1:
                                 qtd_num=lambda d: p_num_series(d[c_p_qtd]),
                             )
 
+                            df_p_filt = df_p_filt[~df_p_filt['almox_limpo'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)].copy()
+
                             if df_p_filt.empty:
                                 continue
 
@@ -3695,7 +3930,11 @@ with tab1:
                             if c_tmp_almox:
                                 cod_tmp = df_tmp[c_tmp_almox].dropna().astype(str).apply(clean_key).mode()
                                 if not cod_tmp.empty:
-                                    movs_parceiras_raw[cod_tmp[0]] = df_tmp
+                                    cod_detectado_tmp = cod_tmp[0]
+                                    if almoxarifado_excluido(cod_detectado_tmp):
+                                        continue
+                                    df_tmp = filtrar_almoxarifados_excluidos(df_tmp, c_tmp_almox)
+                                    movs_parceiras_raw[cod_detectado_tmp] = df_tmp
                         except Exception:
                             pass
                     st.session_state['movs_parceiras_raw'] = movs_parceiras_raw
