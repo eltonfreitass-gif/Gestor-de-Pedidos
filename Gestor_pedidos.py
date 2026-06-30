@@ -795,7 +795,6 @@ def extrair_saldos_estoque_geral(est_geral: pd.DataFrame) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False)
 def aplicar_saldos_validades(df_val: pd.DataFrame, est_geral_raw: pd.DataFrame | None = None) -> pd.DataFrame:
     """Adiciona saldos separados ao painel de validade e aplica a regra operacional.
 
@@ -808,6 +807,11 @@ def aplicar_saldos_validades(df_val: pd.DataFrame, est_geral_raw: pd.DataFrame |
       Saldo AGHU > 0 para a respectiva farmácia.
     - Se o Estoque Geral não estiver disponível, mantém a lista com base na planilha
       de validade, mas deixa Saldo AGHU em branco para evidenciar que falta confirmação.
+
+    Sem cache proposital: esta função é chamada a cada renderização da aba Controle de
+    Validade (guarda de segurança) recebendo DataFrames potencialmente grandes. O custo
+    de hash do st.cache_data nesse caso supera o ganho, já que o resultado raramente é
+    reaproveitado entre chamadas na mesma sessão.
     """
     if df_val is None or df_val.empty:
         return df_val
@@ -861,7 +865,7 @@ def aplicar_saldos_validades(df_val: pd.DataFrame, est_geral_raw: pd.DataFrame |
 
 
 # Alias para manter compatibilidade com chamadas antigas dentro do arquivo.
-@st.cache_data(show_spinner=False)
+# Mesmo motivo: sem cache, ver docstring de aplicar_saldos_validades.
 def aplicar_saldo_atual_validades(df_val: pd.DataFrame, est_geral_raw: pd.DataFrame | None = None) -> pd.DataFrame:
     return aplicar_saldos_validades(df_val, est_geral_raw)
 
@@ -997,6 +1001,19 @@ def normalizar_planilha_validades(df: pd.DataFrame) -> pd.DataFrame:
     out['Saldo Planilha Validade'] = p_num_series(df[c_qtd]) if c_qtd else np.nan
     # Mantém o nome antigo apenas por compatibilidade interna, se alguma sessão antiga reutilizar o dado.
     out['Qtd Controle Validade'] = out['Saldo Planilha Validade']
+
+    # Visibilidade operacional: registra quantos registros tinham linha de validade válida
+    # (código + data preenchidos), mas a farmácia não pôde ser mapeada para um código conhecido
+    # (ex.: "Farmácia Ambulatorial", erro de digitação, célula vazia). Esses registros são
+    # descartados silenciosamente pelo filtro abaixo; o contador fica disponível para a UI
+    # avisar o usuário, sem mudar o comportamento de filtragem já validado.
+    mask_base_valida = (out['key'] != '') & out['Validade'].notna()
+    mask_farmacia_vazia = mask_base_valida & (out['Farmácia'].astype(str).str.strip() == '')
+    n_descartados_farmacia = int(mask_farmacia_vazia.sum())
+    if n_descartados_farmacia > 0:
+        st.session_state['validade_descartados_farmacia_nao_mapeada'] = n_descartados_farmacia
+    else:
+        st.session_state.pop('validade_descartados_farmacia_nao_mapeada', None)
 
     # Regra global: remover almoxarifados fora da gestão do aplicativo.
     out = out[~out['Farmácia'].isin(CODIGOS_ALMOXARIFADOS_EXCLUIR)]
@@ -1149,7 +1166,6 @@ def processar_validades_para_sessao(df_sp_raw: pd.DataFrame, origem: str = "Plan
     )
 
 
-@st.cache_data(show_spinner=False)
 def calcular_remanejamento_preventivo_validade(
     df_validades: pd.DataFrame,
     df_cons: pd.DataFrame,
@@ -1167,6 +1183,10 @@ def calcular_remanejamento_preventivo_validade(
     - O destino não pode ter o mesmo item em alerta de validade até ``dias_max`` dias.
     - A quantidade sugerida é limitada pelo saldo em risco na origem e pela capacidade
       estimada de consumo do destino até a data de validade.
+
+    Sem decorator de cache: o reaproveitamento de resultado já é controlado por
+    obter_remanejamento_validade_session_cache, que mantém o resultado em session_state
+    por assinatura de dados. Ter os dois caches simultâneos seria redundante.
     """
     if df_validades is None or df_validades.empty or df_cons is None or df_cons.empty:
         return pd.DataFrame()
@@ -1357,7 +1377,6 @@ def _cobertura_texto(saldo, cmd) -> str:
     return f"{dias:.1f} dia(s)"
 
 
-@st.cache_data(show_spinner=False)
 def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
                                       df_validades: pd.DataFrame | None = None,
                                       dias_cobertura: int | None = None) -> pd.DataFrame:
@@ -1374,6 +1393,10 @@ def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
     redistribuído de forma proporcional ao CMD, buscando que as farmácias
     consumidoras fiquem com coberturas semelhantes. Farmácias sem consumo
     recente têm estoque-alvo zero e podem doar todo o saldo.
+
+    Sem decorator de cache: o reaproveitamento de resultado já é controlado por
+    obter_remanejamento_geral_session_cache, que mantém o resultado em session_state
+    por assinatura de dados. Ter os dois caches simultâneos seria redundante.
     """
     if df_cons is None or df_cons.empty:
         return pd.DataFrame()
@@ -1457,16 +1480,26 @@ def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
                 mask = mask & (saldo_v > 0)
             chaves_validade = set(zip(dfv.loc[mask, 'key'], dfv.loc[mask, 'Farmácia']))
 
+    # Ordem de prioridade ancorada nas chaves conhecidas de MAPA_STATUS, em vez de
+    # comparação solta por substring. Reduz o risco de quebra silenciosa caso o texto
+    # do parecer mude (acento, espaço extra, etc.) em alguma chamada futura.
+    # "Estoque Crítico no Almoxarifado X" é gerado dinamicamente com o nome do
+    # almoxarifado central (ver definir_alerta_e_acao), por isso mantém checagem
+    # por prefixo fixo para esse caso específico.
+    _ORDEM_PRIORIDADE_PARECER = {
+        "Desabastecimento Crítico": 0,
+        "Remanejar": 1,
+        "Estoque Crítico CAF": 2,
+        "Solicitar": 3,
+    }
+    _PREFIXO_ALMOX_CRITICO = "Estoque Crítico no Almoxarifado"
+
     def _prioridade_parecer(parecer: str) -> int:
-        p = str(parecer)
-        if 'Desabastecimento Crítico' in p:
-            return 0
-        if 'Remanejar' in p:
-            return 1
-        if 'Almoxarifado' in p or 'Estoque Crítico CAF' in p:
+        p = str(parecer).strip()
+        if p in _ORDEM_PRIORIDADE_PARECER:
+            return _ORDEM_PRIORIDADE_PARECER[p]
+        if p.startswith(_PREFIXO_ALMOX_CRITICO):
             return 2
-        if 'Solicitar' in p:
-            return 3
         return 4
 
     resultados = []
@@ -1884,10 +1917,14 @@ def carregar_categorias_do_disco() -> pd.DataFrame:
             st.session_state['categorias_erro_local'] = f"Erro ao carregar categorias locais: {e}"
 
     df_vazio = pd.DataFrame(columns=["Código", "Material", "Categoria", "Antimicrobianos"])
-    try:
-        df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
-    except Exception:
-        pass
+    # Evita tentativa de escrita repetida em ambientes com sistema de arquivos efêmero
+    # (ex.: Streamlit Cloud). Só tenta criar o arquivo local se ele ainda não existir;
+    # se já existe (ou já falhou antes), não há ganho em tentar gravar de novo a cada fallback.
+    if not ARQUIVO_CATEGORIAS.exists():
+        try:
+            df_vazio.to_excel(ARQUIVO_CATEGORIAS, index=False)
+        except Exception:
+            pass
     return df_vazio
 
 
@@ -2114,6 +2151,14 @@ def definir_alerta_e_acao(
     dict_saldos_parceiras: dict,
     consumo_outras_total: dict,
 ) -> tuple:
+    """Define o parecer logístico e a ação sugerida para um item.
+
+    Mantida como apply() linha a linha por necessidade de texto: a função monta
+    frases com nomes de farmácias e quantidades específicas por item, o que não
+    se vetoriza com segurança sem reescrever toda a lógica de mensagens.
+    Os acessos a dicionário usam .get() com dict vazio padrão para evitar
+    recriações repetidas e reduzir custo por chamada.
+    """
     cod        = row['Código MV']
     # Blindagem contra NaN/None vindos de colunas com dados ausentes —
     # evita "Cannot convert non-finite values to integer" mais adiante
@@ -2142,8 +2187,8 @@ def definir_alerta_e_acao(
     if sug <= 0:
         return "Estoque Suficiente", "Estoque dentro da cobertura ideal."
 
-    saldos_parceiras   = dict_saldos_parceiras.get(cod, {})
-    consumos_parceiras = consumo_outras_total.get(cod, {})
+    saldos_parceiras   = dict_saldos_parceiras.get(cod) or {}
+    consumos_parceiras = consumo_outras_total.get(cod) or {}
     farmacias_paradas  = [
         f"Cód {fid} ({DIC_NOMES_FARMACIAS.get(str(fid), 'Farmácia Satélite')} - {int(sf)} un.)"
         for fid, sf in saldos_parceiras.items()
@@ -2154,7 +2199,7 @@ def definir_alerta_e_acao(
     ]
     locais_remanejo = " | ".join(farmacias_paradas)
 
-    saldos_nas_centrais = dict_saldos_centrais.get(cod, {})
+    saldos_nas_centrais = dict_saldos_centrais.get(cod) or {}
     saldo_total_central = sum(saldos_nas_centrais.values())
 
     if saldo_total_central > 0:
@@ -2684,6 +2729,32 @@ with st.sidebar:
         **CMD:** calculado pelos dias com qualquer RM no arquivo (não dias corridos).
 
         **Tendência:** CMD dos últimos 3 dias com movimento vs CMD do período completo.
+
+        ---
+        ### Remanejamentos entre farmácias (aba 🔄 Remanejamentos)
+
+        #### Remanejamento geral por contingência/equalização
+        * **Quando aciona:** apenas quando, para o mesmo item, há simultaneamente:
+          necessidade real por consumo em alguma farmácia, saldo insuficiente nos
+          almoxarifados centrais para cobrir essa necessidade, e saldo disponível em
+          outra farmácia satélite.
+        * **Como distribui:** o saldo das farmácias é redistribuído de forma
+          proporcional ao CMD de cada uma, buscando aproximar a cobertura (em dias)
+          entre as farmácias que consomem o item. Farmácias sem consumo recente têm
+          estoque-alvo zero e podem doar todo o saldo disponível.
+        * **O que NÃO faz:** não equaliza estoques indiscriminadamente; só atua em
+          cenário real de contingência, conforme os gatilhos acima.
+
+        #### Remanejamento preventivo por validade (FEFO)
+        * **Quando aciona:** identifica itens com validade próxima (não vencidos,
+          dentro da janela de até 90 dias) em uma farmácia de origem com saldo AGHU
+          confirmado, e localiza outra farmácia que consome o mesmo item e não possui
+          alerta de validade para ele.
+        * **Como calcula a quantidade:** limitada pelo menor valor entre o saldo em
+          risco de vencer na origem e a capacidade estimada de consumo do destino até
+          a data de validade, com base no CMD do destino.
+        * **Itens vencidos:** não entram nesta análise como oportunidade de uso —
+          a conduta esperada é segregação/retirada conforme rotina institucional.
         """)
 
     with st.expander("🎖️ Créditos do Sistema", expanded=False):
@@ -3133,6 +3204,16 @@ with tab2:
                 "⬆️ O Controle de Validade agora é carregado na aba **📥 Central de Processamento**, "
                 "junto com o Estoque Geral e os arquivos de movimento. Esta aba fica reservada "
                 "para consulta, filtros e exportações do painel FEFO."
+            )
+
+        n_descartados_farm = st.session_state.get('validade_descartados_farmacia_nao_mapeada', 0)
+        if n_descartados_farm > 0:
+            st.warning(
+                f"⚠️ **{n_descartados_farm} registro(s)** da planilha de validade têm código e data "
+                "válidos, mas a farmácia informada não pôde ser identificada (ex.: nome digitado "
+                "de forma diferente do padrão, célula vazia, ou unidade fora das farmácias geridas "
+                "pelo app, como 'Ambulatorial'). Esses registros não aparecem no painel FEFO. "
+                "Revise a coluna de farmácia/unidade na planilha de validade, se necessário."
             )
 
         if st.button("🔁 Reaplicar filtro de saldo AGHU no painel de validades", use_container_width=True):
