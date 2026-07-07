@@ -297,7 +297,8 @@ def _aplicar_estilo_aba(ws, wb, df: pd.DataFrame, col_alerta: str,
                          larguras: dict, fmt_h, fmt_b, fmt_t,
                          fmt_status_cache: dict, fmt_critico,
                          ajustar_altura_linhas: bool = True,
-                         ocultar_colunas: list | None = None) -> None:
+                         ocultar_colunas: list | None = None,
+                         orientacao_impressao: str = "landscape") -> None:
     """Aplica cabeçalho, larguras, altura dinâmica e formatação condicional a uma aba.
 
     Quando ajustar_altura_linhas=False, não fixa a altura das linhas de dados.
@@ -332,6 +333,9 @@ def _aplicar_estilo_aba(ws, wb, df: pd.DataFrame, col_alerta: str,
         if cn in df.columns:
             ci = df.columns.get_loc(cn)
             ws.set_column(ci, ci, None, None, {'hidden': True})
+
+    # Configuração padronizada para impressão em A4.
+    aplicar_configuracao_impressao_excel(ws, df, orientacao=orientacao_impressao)
 
     # Formatação condicional por status
     if col_alerta in df.columns:
@@ -379,8 +383,59 @@ def normalizar_nome_aba_excel(nome_aba: str = "Dados") -> str:
     return nome[:31]
 
 
+def aplicar_configuracao_impressao_excel(
+    ws,
+    df: pd.DataFrame,
+    orientacao: str = "landscape",
+) -> None:
+    """Padroniza a impressão dos relatórios Excel.
+
+    Regras aplicadas a todos os relatórios:
+    - papel A4;
+    - cabeçalho da tabela repetido em todas as páginas impressas;
+    - todas as colunas ajustadas para caber em uma página de largura;
+    - altura livre, permitindo quantas páginas forem necessárias;
+    - margens compactas e centralização horizontal.
+
+    Orientação padrão: paisagem (horizontal).
+    Exceção operacional: relatório de pedido classificado por categoria pode usar retrato (vertical).
+    """
+    try:
+        orientacao_norm = clean(orientacao)
+        if orientacao_norm in ("portrait", "retrato", "vertical"):
+            ws.set_portrait()
+        else:
+            ws.set_landscape()
+
+        # 9 = A4 no XlsxWriter/Excel.
+        ws.set_paper(9)
+
+        # Repete a linha de títulos das colunas em todas as páginas impressas.
+        ws.repeat_rows(0)
+
+        # Garante que todas as colunas caibam em uma única página de largura.
+        # A altura fica livre para múltiplas páginas, mantendo o cabeçalho repetido.
+        ws.fit_to_pages(1, 0)
+
+        # Área de impressão restrita à tabela preenchida.
+        if df is not None and not df.empty and len(df.columns) > 0:
+            ws.print_area(0, 0, len(df), len(df.columns) - 1)
+
+        # Margens compactas para melhorar legibilidade em A4.
+        ws.set_margins(left=0.25, right=0.25, top=0.45, bottom=0.45)
+        ws.center_horizontally()
+        ws.set_footer('&C&P de &N')
+    except Exception:
+        # A configuração de impressão não deve impedir a geração do relatório.
+        pass
+
+
 @st.cache_data(show_spinner=False)
-def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") -> bytes:
+def exportar_excel_padronizado(
+    df_dados: pd.DataFrame,
+    nome_aba: str = "Dados",
+    orientacao_impressao: str = "landscape",
+) -> bytes:
     buf = io.BytesIO()
     nome_aba = normalizar_nome_aba_excel(nome_aba)
     with pd.ExcelWriter(buf, engine='xlsxwriter') as wr:
@@ -404,7 +459,8 @@ def exportar_excel_padronizado(df_dados: pd.DataFrame, nome_aba: str = "Dados") 
 
         fmt_status_cache: dict = {}
         _aplicar_estilo_aba(ws, wb, df_dados, col_alerta, larguras,
-                            fmt_h, fmt_b, fmt_t, fmt_status_cache, fmt_critico)
+                            fmt_h, fmt_b, fmt_t, fmt_status_cache, fmt_critico,
+                            orientacao_impressao=orientacao_impressao)
     return buf.getvalue()
 
 
@@ -413,7 +469,8 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
                               col_categoria: str, col_alerta: str,
                               larguras: dict, excluir_acoes: list = None,
                               ocultar_colunas: list | None = None,
-                              ajustar_altura_linhas: bool = True) -> bytes:
+                              ajustar_altura_linhas: bool = True,
+                              orientacao_impressao: str = "landscape") -> bytes:
     buf = io.BytesIO()
     excluir_acoes = excluir_acoes or []
     ocultar_colunas = ocultar_colunas or []
@@ -453,7 +510,8 @@ def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
             _aplicar_estilo_aba(ws, wb, df_exp, col_alerta, larguras,
                                 fmt_h, fmt_b, fmt_t, fmt_status_cache, fmt_critico,
                                 ajustar_altura_linhas=ajustar_altura_linhas,
-                                ocultar_colunas=ocultar_colunas)
+                                ocultar_colunas=ocultar_colunas,
+                                orientacao_impressao=orientacao_impressao)
     return buf.getvalue()
 
 
@@ -484,12 +542,40 @@ def _hash_dataframe_operacional(df: pd.DataFrame | None, cols: list[str] | None 
         return f"fallback|{df.shape}|{','.join(map(str, df.columns))}"
 
 
+def invalidar_cache_remanejamentos():
+    """Remove resultados de remanejamento derivados da consolidação atual.
+
+    Quando uma nova consolidação é gerada, os remanejamentos anteriores podem
+    ficar defasados em relação aos novos saldos/CMDs. A invalidação centralizada
+    evita que a aba Remanejamentos mostre resultado antigo e elimina o atraso de
+    sincronização entre a geração da consolidação e a visualização dos remanejamentos.
+    """
+    chaves = [
+        'df_remanejamento_geral_huufma',
+        'assinatura_remanejamento_geral_huufma',
+        'df_remanejamento_validade_huufma',
+        'assinatura_remanejamento_validade_huufma',
+        'remanejamento_geral_ultima_atualizacao',
+        'remanejamento_validade_ultima_atualizacao',
+    ]
+    for k in chaves:
+        st.session_state.pop(k, None)
+
+    # Relatórios gerados a partir dos remanejamentos também precisam ser refeitos
+    # quando a consolidação muda. Os demais relatórios continuam sendo invalidados
+    # pela própria assinatura do dataframe na função sob demanda.
+    for k in list(st.session_state.keys()):
+        if k.startswith('relatorio_excel_remanejamento_'):
+            st.session_state.pop(k, None)
+
+
 def _limpar_resultados_derivados():
     """Remove caches dependentes dos arquivos/parâmetros quando há novo processamento."""
     prefixos = [
         'df_consolidado', 'assinatura_consolidacao_huufma',
         'df_remanejamento_geral_huufma', 'assinatura_remanejamento_geral_huufma',
         'df_remanejamento_validade_huufma', 'assinatura_remanejamento_validade_huufma',
+        'remanejamento_geral_ultima_atualizacao', 'remanejamento_validade_ultima_atualizacao',
     ]
     for k in list(st.session_state.keys()):
         if k in prefixos or k.startswith('relatorio_excel_'):
@@ -570,12 +656,13 @@ def gerar_download_excel_sob_demanda(
     key: str,
     help: str | None = None,
     use_container_width: bool = True,
+    orientacao_impressao: str = "landscape",
 ):
     """Gera o Excel apenas quando o usuário solicita, evitando travar filtros/abas."""
     key_sig = f"relatorio_excel_{key}_sig"
     key_bytes = f"relatorio_excel_{key}_bytes"
     key_name = f"relatorio_excel_{key}_file"
-    sig = _assinatura_relatorio(df_dados, nome_aba, file_name)
+    sig = _assinatura_relatorio(df_dados, nome_aba, f"{file_name}|{orientacao_impressao}")
     if st.session_state.get(key_sig) != sig:
         st.session_state.pop(key_bytes, None)
         st.session_state[key_sig] = sig
@@ -589,7 +676,9 @@ def gerar_download_excel_sob_demanda(
         type="primary",
     ):
         with st.spinner("📄 Gerando arquivo Excel..."):
-            st.session_state[key_bytes] = exportar_excel_padronizado(df_dados.copy(), nome_aba)
+            st.session_state[key_bytes] = exportar_excel_padronizado(
+                df_dados.copy(), nome_aba, orientacao_impressao=orientacao_impressao
+            )
             st.session_state[key_name] = file_name
 
     if key_bytes in st.session_state:
@@ -618,6 +707,7 @@ def gerar_download_multi_aba_sob_demanda(
     ajustar_altura_linhas: bool = True,
     help: str | None = None,
     use_container_width: bool = True,
+    orientacao_impressao: str = "landscape",
 ):
     """Versão sob demanda para relatórios Excel com múltiplas abas."""
     excluir_acoes = excluir_acoes or []
@@ -625,7 +715,7 @@ def gerar_download_multi_aba_sob_demanda(
     key_sig = f"relatorio_excel_{key}_sig"
     key_bytes = f"relatorio_excel_{key}_bytes"
     key_name = f"relatorio_excel_{key}_file"
-    extra = repr((ordem_cols, col_categoria, col_alerta, larguras, excluir_acoes, ocultar_colunas, ajustar_altura_linhas, file_name))
+    extra = repr((ordem_cols, col_categoria, col_alerta, larguras, excluir_acoes, ocultar_colunas, ajustar_altura_linhas, orientacao_impressao, file_name))
     sig = _assinatura_relatorio(df_total, "multi_aba", extra)
     if st.session_state.get(key_sig) != sig:
         st.session_state.pop(key_bytes, None)
@@ -645,6 +735,7 @@ def gerar_download_multi_aba_sob_demanda(
                 excluir_acoes=excluir_acoes,
                 ocultar_colunas=ocultar_colunas,
                 ajustar_altura_linhas=ajustar_altura_linhas,
+                orientacao_impressao=orientacao_impressao,
             )
             st.session_state[key_name] = file_name
 
@@ -2630,6 +2721,7 @@ def render_painel_pedido_completo() -> None:
                 file_name=f"Pedido_Abas_{cod_farmacia_alvo}_{datetime.now().strftime('%d%m%y')}.xlsx",
                 key=f"pedido_abas_{cod_farmacia_alvo}",
                 use_container_width=True,
+                orientacao_impressao="portrait",
             )
         with b3:
             df_filtrado_export = df_filtrado[cols_exibicao]
@@ -3386,6 +3478,10 @@ with tab3:
         "na Aba 1 para gerar uma visão unificada de todas as farmácias."
     )
 
+    msg_consolidacao = st.session_state.pop('consolidacao_msg_pos_rerun', '')
+    if msg_consolidacao:
+        st.success(msg_consolidacao)
+
     if 'est_geral_raw' not in st.session_state or 'mov_alvo_raw' not in st.session_state:
         st.warning(
             "⚠️ Processe os dados na **Aba 1** primeiro. "
@@ -3427,7 +3523,48 @@ with tab3:
             if resultados:
                 df_consolidado = pd.concat(resultados, ignore_index=True)
                 st.session_state['df_consolidado'] = df_consolidado
+                st.session_state['consolidacao_ultima_atualizacao'] = datetime.now().strftime('%d/%m/%Y %H:%M')
                 prog_c.progress(100, text="✅ Consolidação concluída!")
+
+                # Sincronização imediata com a aba Remanejamentos.
+                # Como o Streamlit executa o script de cima para baixo, a aba Remanejamentos
+                # é renderizada antes da Consolidação neste arquivo. Sem este bloco, a nova
+                # consolidação só fica visível para os remanejamentos no rerun seguinte,
+                # dando a impressão de que é necessário clicar em gerar consolidação várias vezes.
+                invalidar_cache_remanejamentos()
+                with st.spinner("🔄 Preparando remanejamentos com base na nova consolidação..."):
+                    df_val_rem_sync = st.session_state.get('df_validades_mescladas', pd.DataFrame())
+                    if (
+                        isinstance(df_val_rem_sync, pd.DataFrame) and
+                        not df_val_rem_sync.empty and
+                        'est_geral_raw' in st.session_state
+                    ):
+                        df_val_rem_sync = aplicar_saldos_validades(
+                            df_val_rem_sync.copy(), st.session_state['est_geral_raw']
+                        )
+
+                    obter_remanejamento_geral_session_cache(
+                        df_consolidado,
+                        df_val_rem_sync,
+                        dias_cobertura=dias_ped,
+                        forcar_recalculo=True,
+                    )
+
+                    if isinstance(df_val_rem_sync, pd.DataFrame) and not df_val_rem_sync.empty:
+                        obter_remanejamento_validade_session_cache(
+                            df_val_rem_sync,
+                            df_consolidado,
+                            forcar_recalculo=True,
+                        )
+                    else:
+                        st.session_state['df_remanejamento_validade_huufma'] = pd.DataFrame()
+                        st.session_state['remanejamento_validade_ultima_atualizacao'] = 'não aplicável — validade não carregada'
+
+                st.session_state['consolidacao_msg_pos_rerun'] = (
+                    "✅ Consolidação multi-farmácia concluída e remanejamentos sincronizados. "
+                    "A aba Remanejamentos já pode ser consultada sem gerar a consolidação novamente."
+                )
+                st.rerun()
             else:
                 st.error("❌ Nenhum dado pôde ser consolidado. Verifique os arquivos.")
 
