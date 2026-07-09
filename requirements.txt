@@ -7,3 +7,4 @@ openpyxl
 requests
 Office365-REST-Python-Client
 xlrd
+pytest
