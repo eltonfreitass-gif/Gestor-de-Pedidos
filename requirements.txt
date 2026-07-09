@@ -1,8 +1,9 @@
-streamlit==1.59.1
-pandas==2.3.3
-numpy==2.2.6
-altair==5.5.0
-xlsxwriter==3.2.9
-openpyxl==3.1.5
-requests==2.34.2
-Office365-REST-Python-Client==2.6.2
+streamlit
+pandas
+numpy
+altair
+xlsxwriter
+openpyxl
+requests
+Office365-REST-Python-Client
+xlrd
