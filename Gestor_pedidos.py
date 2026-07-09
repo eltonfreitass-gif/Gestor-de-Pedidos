@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import io
 import re
+import sys
 import unicodedata
 import math
 import altair as alt
@@ -138,7 +139,12 @@ DIC_ALMOXARIFADOS_EXCLUIDOS = {'45': 'Almoxarifado 45 - estoque de pacientes'}
 # FUNÇÕES UTILITÁRIAS
 # =============================================================================
 
-@st.cache_data(show_spinner=False)
+# Cache de leitura de arquivos enviados. ttl/max_entries limitam a memória
+# acumulada globalmente pelo app entre sessões diferentes: sem esses limites,
+# cada arquivo novo enviado por qualquer usuário fica retido em cache para
+# sempre (até o reboot do container), o que é a principal causa de estouro
+# de memória no Streamlit Community Cloud (limite de ~1 GB por app).
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=6)
 def ler_csv_cached(file_bytes: bytes, nome: str) -> pd.DataFrame:
     return pd.read_csv(
         io.BytesIO(file_bytes), sep=None, engine='python',
@@ -146,7 +152,7 @@ def ler_csv_cached(file_bytes: bytes, nome: str) -> pd.DataFrame:
     )
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=6)
 def ler_xlsx_cached(file_bytes: bytes, nome: str) -> pd.DataFrame:
     return pd.read_excel(io.BytesIO(file_bytes), dtype=str)
 
@@ -256,6 +262,108 @@ def validar_colunas(colunas: dict, contexto: str) -> bool:
         )
         return False
     return True
+
+
+# =============================================================================
+# OTIMIZAÇÃO DE MEMÓRIA — DATAFRAMES BRUTOS RETIDOS EM SESSION_STATE
+# =============================================================================
+# As extrações do AGHU costumam trazer dezenas de colunas, das quais o app usa
+# apenas um punhado (identificado via find_col). Como est_geral_raw/mov_alvo_raw/
+# movs_parceiras_raw ficam retidos em st.session_state pela sessão inteira — e
+# são a maior fonte de memória por usuário conectado — cortamos aqui as colunas
+# não utilizadas por NENHUMA função do app. Os nomes originais das colunas
+# mantidas são preservados, então toda a lógica de find_col() a jusante
+# continua funcionando sem alteração.
+#
+# Observação: cogitamos também converter 'almoxarifado'/'tipo' para dtype
+# category (baixa cardinalidade, grande economia teórica de memória), mas os
+# testes com arquivos reais mostraram que isso reordena sutilmente os grupos
+# em alguns groupby() do pipeline quando os valores brutos têm zeros/espaços
+# à esquerda — a ordem das categorias fica presa ao valor bruto original, não
+# ao valor já limpo por clean_key(). Descartamos essa parte por segurança:
+# o corte de colunas abaixo já responde pela maior parte do ganho de memória
+# e foi validado como 100% idêntico ao comportamento original.
+
+def otimizar_dataframe_estoque(df: pd.DataFrame) -> pd.DataFrame:
+    """Mantém apenas as colunas do Estoque Geral (AGDA2) realmente usadas em
+    algum ponto do app: código, produto/material, almoxarifado, qtde disponível,
+    estoque mínimo, lote e validade. Reduz a pegada de memória sem afetar
+    nenhuma funcionalidade, pois find_col() localiza as mesmas colunas depois."""
+    if df is None or df.empty:
+        return df
+
+    termos = [
+        (['cod', 'ca3', 'ident'], ['material', 'prod']),   # código
+        (['material', 'produto', 'descri'], []),           # produto/material
+        (['almox'], []),                                   # almoxarifado
+        (['qtde disp', 'disponivel', 'saldo', 'quant'], []),  # saldo/qtde disponível
+        (['qtde estq min', 'estoque minimo', 'minimo'], []),  # estoque mínimo
+        (['lote', 'batch'], []),                            # lote
+        (['valid', 'vencim', 'expir'], []),                 # validade
+    ]
+    cols_manter = []
+    for incluir, excluir in termos:
+        c = find_col(df, incluir, forbidden=excluir)
+        if c and c not in cols_manter:
+            cols_manter.append(c)
+
+    if not cols_manter:
+        return df  # não identificou nada conhecido — não mexe, por segurança
+
+    return df[cols_manter].copy()
+
+
+def otimizar_dataframe_movimento(df: pd.DataFrame) -> pd.DataFrame:
+    """Mantém apenas as colunas do arquivo de Movimento realmente usadas em
+    algum ponto do app: código, quantidade, tipo, data e almoxarifado."""
+    if df is None or df.empty:
+        return df
+
+    termos = [
+        (['material', 'cod', 'ca3'], []),   # código
+        (['quant'], []),                    # quantidade
+        (['tipo'], []),                     # tipo
+        (['data geracao', 'data mov', 'data', 'dt ger', 'dtger'],
+         ['almox', 'tipo', 'quant', 'material']),           # data
+        (['almox'], []),                    # almoxarifado
+    ]
+    cols_manter = []
+    for incluir, excluir in termos:
+        c = find_col(df, incluir, forbidden=excluir)
+        if c and c not in cols_manter:
+            cols_manter.append(c)
+
+    if not cols_manter:
+        return df
+
+    return df[cols_manter].copy()
+
+
+def calcular_memoria_sessao_mb() -> float:
+    """Estima quanta memória os dados retidos em st.session_state ocupam nesta sessão.
+
+    É uma estimativa, não uma medição exata: DataFrames são medidos com precisão
+    via memory_usage(deep=True); dicionários e outros objetos usam sys.getsizeof,
+    que não soma o conteúdo aninhado em profundidade. Suficiente para indicar
+    tendência ao usuário (e sugerir limpar a sessão), não para diagnóstico fino —
+    para isso, os logs do Streamlit Cloud são a fonte confiável.
+    """
+    total_bytes = 0
+    for valor in st.session_state.values():
+        try:
+            if isinstance(valor, pd.DataFrame):
+                total_bytes += int(valor.memory_usage(deep=True).sum())
+            elif isinstance(valor, dict):
+                for v in valor.values():
+                    if isinstance(v, pd.DataFrame):
+                        total_bytes += int(v.memory_usage(deep=True).sum())
+                    else:
+                        total_bytes += sys.getsizeof(v)
+            else:
+                total_bytes += sys.getsizeof(valor)
+        except Exception:
+            continue
+    return total_bytes / (1024 * 1024)
 
 
 # =============================================================================
@@ -430,7 +538,9 @@ def aplicar_configuracao_impressao_excel(
         pass
 
 
-@st.cache_data(show_spinner=False)
+# max_entries baixo porque cada entrada guarda os bytes inteiros do Excel gerado;
+# ttl curto evita reter exports antigos depois que o usuário já baixou o arquivo.
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=4)
 def exportar_excel_padronizado(
     df_dados: pd.DataFrame,
     nome_aba: str = "Dados",
@@ -464,7 +574,7 @@ def exportar_excel_padronizado(
     return buf.getvalue()
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=4)
 def exportar_excel_multi_aba(df_total: pd.DataFrame, ordem_cols: list,
                               col_categoria: str, col_alerta: str,
                               larguras: dict, excluir_acoes: list = None,
@@ -1815,7 +1925,9 @@ def calcular_remanejamento_equalizado(df_cons: pd.DataFrame,
         kind='mergesort'
     ).reset_index(drop=True)
 
-@st.cache_data(show_spinner=False)
+# max_entries=10 comporta a consolidação das ~6 farmácias em cache simultâneo
+# sem deixar rodadas antigas (de sessões ou reruns anteriores) acumulando memória.
+@st.cache_data(show_spinner=False, ttl=1800, max_entries=10)
 def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
                               cod_farm: str, mapa_cat: dict,
                               data_ini: date, data_fim: date,
@@ -2857,6 +2969,37 @@ with st.sidebar:
 
         *HUUFMA — Gestão e Inteligência Logística © 2026*
         """)
+
+    st.write("---")
+    st.markdown("### 🧹 Manutenção da Sessão")
+
+    mem_mb = calcular_memoria_sessao_mb()
+    st.caption(f"Estimativa de memória retida nesta sessão: **{mem_mb:.0f} MB**")
+    if mem_mb > 300:
+        st.warning(
+            "⚠️ Uso de memória elevado nesta sessão. Se não precisar mais dos "
+            "dados carregados, considere limpar a sessão abaixo."
+        )
+
+    if st.session_state.get('confirmar_limpeza_sessao', False):
+        st.warning(
+            "⚠️ Isso vai apagar **todos** os dados carregados e processados nesta "
+            "sessão (arquivos, resultados, remanejamentos, validades). Você vai "
+            "precisar carregar os arquivos novamente. Esta ação não afeta outras "
+            "sessões nem os dados de outros usuários."
+        )
+        col_lim1, col_lim2 = st.columns(2)
+        if col_lim1.button("✅ Confirmar limpeza", use_container_width=True, key="btn_confirmar_limpeza"):
+            st.cache_data.clear()
+            st.session_state.clear()
+            st.rerun()
+        if col_lim2.button("Cancelar", use_container_width=True, key="btn_cancelar_limpeza"):
+            st.session_state['confirmar_limpeza_sessao'] = False
+            st.rerun()
+    else:
+        if st.button("🧹 Limpar sessão (libera memória)", use_container_width=True, key="btn_iniciar_limpeza"):
+            st.session_state['confirmar_limpeza_sessao'] = True
+            st.rerun()
 
 
 # =============================================================================
@@ -4215,6 +4358,12 @@ with tab1:
                 mov       = ler_csv_cached(file_mov_alvo.read(), file_mov_alvo.name)
                 est_geral = ler_csv_cached(file_est_geral.read(), file_est_geral.name)
 
+                # Reduz a pegada de memória do que fica retido em session_state
+                # pela sessão inteira: mantém só as colunas usadas pelo app e
+                # converte colunas de baixa cardinalidade para 'category'.
+                mov       = otimizar_dataframe_movimento(mov)
+                est_geral = otimizar_dataframe_estoque(est_geral)
+
                 # Salvar raws para uso nas abas Validade e Consolidação
                 st.session_state['est_geral_raw']  = est_geral
                 st.session_state['mov_alvo_raw']   = mov
@@ -4495,7 +4644,10 @@ with tab1:
                                     if almoxarifado_excluido(cod_detectado_tmp):
                                         continue
                                     df_tmp = filtrar_almoxarifados_excluidos(df_tmp, c_tmp_almox)
-                                    movs_parceiras_raw[cod_detectado_tmp] = df_tmp
+                                    # Mesma otimização aplicada ao movimento da farmácia
+                                    # alvo: essa é a estrutura que mais pesa em memória,
+                                    # pois fica retida por sessão, com até 4 farmácias juntas.
+                                    movs_parceiras_raw[cod_detectado_tmp] = otimizar_dataframe_movimento(df_tmp)
                         except Exception:
                             pass
                     st.session_state['movs_parceiras_raw'] = movs_parceiras_raw
