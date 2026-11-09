@@ -114,8 +114,12 @@ GOOGLE_SHEETS_CATEGORIAS_LINK = (
     f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEETS_CATEGORIAS_ID}/edit?usp=sharing"
 )
 
-# Janela de tendência de consumo (últimos N dias com movimento)
-JANELA_TENDENCIA_DIAS = 3
+# Parâmetros da previsão de consumo
+JANELA_HISTORICO_PADRAO_DIAS = 30
+JANELA_TENDENCIA_DIAS = 7
+DIAS_MINIMOS_HISTORICO_TENDENCIA = 14
+LIMIAR_CMD_BAIXO_CONSUMO = 1.0  # unidade por dia ativo da farmácia
+DIAS_MINIMOS_MOVIMENTO_ITEM_TENDENCIA = 2  # datas distintas com RM em cada janela
 
 # Faixas de alerta de validade (dias até o vencimento)
 VALIDADE_CRITICO_DIAS  = 30   # 🔴 vence em até 30 dias
@@ -394,8 +398,9 @@ def _altura_linha(row_values: list, col_widths: list) -> int:
 LARGURAS_PADRAO_EXCEL = {
     'Código MV': 12, 'Material': 45, 'Categoria': 16,
     'Saldo Atual Satélite': 20, 'Consumo Médio Diário': 20,
+    'CMD Histórico': 16, 'CMD Últ. 7 dias': 16, 'Perfil de Consumo': 34,
     'Estoque Mínimo': 16, 'Cobertura (dias)': 14,
-    'CMD Últ. 3 dias': 16, 'Tendência': 12, 'Δ% Tendência': 12,
+    'Tendência': 12, 'Δ% Tendência': 12,
     'Saldo Almox. Centrais Unificado': 28, 'Ação Logística Sugerida': 50,
     'Parecer Logístico / Alerta': 26,
 }
@@ -1980,17 +1985,66 @@ def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
         return pd.DataFrame()
 
     mov = filtrar_almoxarifados_excluidos(df_mov, c_ma) if c_ma else df_mov.copy()
+    if c_ma:
+        mov = mov[mov[c_ma].apply(clean_key) == clean_key(cod_farm)].copy()
     mov['dt_fmt'] = pd.to_datetime(mov[c_md], dayfirst=False, errors='coerce')
-    mov_f = mov[(mov['dt_fmt'].dt.date >= data_ini) &
-                (mov['dt_fmt'].dt.date <= data_fim) &
-                (mov[c_mt].astype(str).str.upper() == 'RM')].copy()
+    mov_periodo = mov[
+        (mov['dt_fmt'].dt.date >= data_ini)
+        & (mov['dt_fmt'].dt.date <= data_fim)
+    ].copy()
+    mov_f = mov_periodo[
+        mov_periodo[c_mt].astype(str).str.strip().str.upper() == 'RM'
+    ].copy()
 
-    dias_ef = max(mov_f['dt_fmt'].dt.date.nunique(), 1)
+    # O denominador é formado por todas as datas com qualquer movimento da
+    # farmácia, não apenas pelas datas em que o item teve RM.
+    dias_periodo = contar_dias_com_movimentacao(
+        mov_periodo, 'dt_fmt', data_ini, data_fim
+    )
+    dias_corridos_periodo = max((data_fim - data_ini).days + 1, 0)
     consumo = (mov_f.assign(qtd_num=lambda d: p_num_series(d[c_mq]),
                             key=lambda d: d[c_mc].apply(clean_key))
                .groupby('key')['qtd_num'].sum().reset_index())
-    consumo['cmd'] = consumo['qtd_num'].apply(lambda x: calcular_cmd(x, dias_ef))
-    consumo_map = consumo.set_index('key')['cmd'].to_dict()
+    consumo['cmd_historico'] = consumo['qtd_num'].apply(
+        lambda x: calcular_cmd(x, dias_periodo)
+    )
+    consumo_map = consumo.set_index('key')['cmd_historico'].to_dict()
+
+    janelas_tendencia_farm = obter_janelas_tendencia(
+        data_ini, data_fim, JANELA_TENDENCIA_DIAS
+    )
+    dias_farm_recente = contar_dias_com_movimentacao(
+        mov, 'dt_fmt', janelas_tendencia_farm['inicio_recente'],
+        janelas_tendencia_farm['fim_recente'],
+    ) if janelas_tendencia_farm['inicio_recente'] is not None else 0
+    dias_farm_anterior = contar_dias_com_movimentacao(
+        mov, 'dt_fmt', janelas_tendencia_farm['inicio_anterior'],
+        janelas_tendencia_farm['fim_anterior'],
+    ) if janelas_tendencia_farm['inicio_anterior'] is not None else 0
+
+    df_tendencia_farm = calcular_tendencia(
+        mov, c_mc, c_mq, c_mt,
+        data_ini=data_ini,
+        data_fim=data_fim,
+        n_dias=JANELA_TENDENCIA_DIAS,
+        coluna_data='dt_fmt',
+    )
+    tendencia_map = (
+        df_tendencia_farm.set_index('key')['cmd_tendencia'].to_dict()
+        if not df_tendencia_farm.empty else {}
+    )
+    tendencia_anterior_map = (
+        df_tendencia_farm.set_index('key')['cmd_anterior'].to_dict()
+        if not df_tendencia_farm.empty else {}
+    )
+    dias_consumo_recente_map = (
+        df_tendencia_farm.set_index('key')['dias_consumo_tendencia'].to_dict()
+        if not df_tendencia_farm.empty else {}
+    )
+    dias_consumo_anterior_map = (
+        df_tendencia_farm.set_index('key')['dias_consumo_anterior'].to_dict()
+        if not df_tendencia_farm.empty else {}
+    )
 
     todos = sorted(set(est[est['almox_limpo'] == cod_farm]['key']) | set(consumo['key']))
     final = pd.DataFrame({'Código MV': todos})
@@ -2001,7 +2055,33 @@ def calcular_status_farmacia(df_estoque: pd.DataFrame, df_mov: pd.DataFrame,
     mapa_antimicrobianos = mapa_antimicrobianos or {}
     final['Antimicrobianos']      = final['Código MV'].map(mapa_antimicrobianos).fillna('NÃO').apply(normalizar_antimicrobiano)
     final['Saldo Atual']          = final['Código MV'].map(est_farm).fillna(0)
-    final['CMD']                  = final['Código MV'].map(consumo_map).fillna(0)
+    final['Dias com movimentação no histórico'] = dias_periodo
+    final['Dias ativos últimos 7 dias'] = dias_farm_recente
+    final['Dias ativos 7 dias anteriores'] = dias_farm_anterior
+    final['CMD Histórico']        = final['Código MV'].map(consumo_map).fillna(0.0)
+    final['CMD Últ. 7 dias']      = final['Código MV'].map(tendencia_map).fillna(0.0)
+    final['CMD 7 dias anteriores'] = final['Código MV'].map(tendencia_anterior_map).fillna(0.0)
+    cmd_ajustado, perfil_consumo = calcular_cmd_ajustado(
+        final['CMD Histórico'],
+        final['CMD Últ. 7 dias'],
+        dias_corridos_periodo,
+    )
+    final['CMD']                  = cmd_ajustado
+    final['Perfil de Consumo']    = perfil_consumo
+    final['_dias_consumo_recente'] = final['Código MV'].map(dias_consumo_recente_map).fillna(0)
+    final['_dias_consumo_anterior'] = final['Código MV'].map(dias_consumo_anterior_map).fillna(0)
+    final['_dias_farmacia_recente'] = dias_farm_recente
+    final['_dias_farmacia_anterior'] = dias_farm_anterior
+    final['_dias_calendario_recente'] = janelas_tendencia_farm['dias_calendario_recente']
+    final['_dias_calendario_anterior'] = janelas_tendencia_farm['dias_calendario_anterior']
+    final[['Tendência', 'Δ% Tendência']] = final.apply(
+        calcular_delta_tendencia, axis=1, result_type='expand'
+    )
+    final.drop(columns=[
+        '_dias_consumo_recente', '_dias_consumo_anterior',
+        '_dias_farmacia_recente', '_dias_farmacia_anterior',
+        '_dias_calendario_recente', '_dias_calendario_anterior',
+    ], inplace=True)
     final['Estoque Mínimo']       = final['Código MV'].map(est_min).fillna(0)
     final['Saldo Central']        = final['Código MV'].apply(
         lambda c: sum(dict_centrais.get(c, {}).values()))
@@ -2220,38 +2300,279 @@ def obter_mapa_antimicrobianos() -> dict:
 # LÓGICA DE NEGÓCIO
 # =============================================================================
 
-def calcular_cmd(qtd_total: float, dias_com_movimento: int) -> float:
-    cmd_bruto = qtd_total / max(dias_com_movimento, 1)
-    return float(math.ceil(cmd_bruto)) if cmd_bruto > 0 else 0.0
+def calcular_cmd(qtd_total: float, dias_periodo: int) -> float:
+    """Calcula o CMD sem arredondamento.
+
+    O denominador é a quantidade de datas distintas em que a farmácia teve
+    qualquer movimentação no período, independentemente do item ou do tipo de
+    movimento. Datas sem registro na base não entram no cálculo.
+    """
+    try:
+        total = float(qtd_total)
+        dias = int(dias_periodo)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if not math.isfinite(total) or dias <= 0:
+        return 0.0
+
+    return max(total, 0.0) / dias
 
 
-def calcular_tendencia(mov_filtrado: pd.DataFrame, c_mov_cod: str,
-                        c_mov_qtd: str,
-                        n_dias: int = JANELA_TENDENCIA_DIAS) -> pd.DataFrame:
-    # 1. Identificar o período exato que estamos olhando (Lógica ajustada para 0)
-    datas_unicas = sorted(mov_filtrado['dt_formatada'].dt.date.unique(), reverse=True)
-    ultimos_n_dias = datas_unicas[:n_dias]
+def contar_dias_com_movimentacao(
+    movimentos: pd.DataFrame,
+    coluna_data: str,
+    data_ini: date,
+    data_fim: date,
+) -> int:
+    """Conta datas distintas com ao menos um registro de movimento da farmácia.
 
-    if not ultimos_n_dias:
-        return pd.DataFrame(columns=['key', 'cmd_tendencia'])
+    Não filtra por item nem por tipo de movimento: a data é considerada ativa
+    para todos os itens se houver qualquer movimentação da farmácia naquele dia.
+    """
+    if (
+        movimentos is None
+        or movimentos.empty
+        or coluna_data not in movimentos.columns
+        or data_ini > data_fim
+    ):
+        return 0
 
-    # 2. Filtrar apenas o movimento desses dias
-    mov_tend = mov_filtrado[mov_filtrado['dt_formatada'].dt.date.isin(ultimos_n_dias)].copy()
+    datas = pd.to_datetime(movimentos[coluna_data], errors="coerce").dt.date
+    mascara = datas.notna() & (datas >= data_ini) & (datas <= data_fim)
+    return int(datas.loc[mascara].nunique())
 
-    # 3. Agrupar somando o consumo
-    consumo_tend = (
-        mov_tend
-        .assign(qtd_num=lambda df: p_num_series(df[c_mov_qtd]))
-        .assign(key=lambda df: df[c_mov_cod].apply(clean_key))
-        .groupby('key')['qtd_num'].sum()
-        .reset_index()
+
+def obter_janelas_tendencia(
+    data_ini: date,
+    data_fim: date,
+    n_dias: int = JANELA_TENDENCIA_DIAS,
+) -> dict:
+    """Retorna duas janelas consecutivas, não sobrepostas, de até N dias corridos."""
+    inicio_periodo = pd.Timestamp(data_ini).date()
+    fim_periodo = pd.Timestamp(data_fim).date()
+    janela = max(int(n_dias), 1)
+
+    if inicio_periodo > fim_periodo:
+        return {
+            "inicio_recente": None, "fim_recente": None,
+            "inicio_anterior": None, "fim_anterior": None,
+            "dias_calendario_recente": 0, "dias_calendario_anterior": 0,
+        }
+
+    inicio_recente = max(inicio_periodo, fim_periodo - timedelta(days=janela - 1))
+    fim_recente = fim_periodo
+    fim_anterior = inicio_recente - timedelta(days=1)
+
+    if fim_anterior < inicio_periodo:
+        inicio_anterior = None
+        fim_anterior = None
+        dias_anterior = 0
+    else:
+        inicio_anterior = max(inicio_periodo, fim_anterior - timedelta(days=janela - 1))
+        dias_anterior = (fim_anterior - inicio_anterior).days + 1
+
+    return {
+        "inicio_recente": inicio_recente,
+        "fim_recente": fim_recente,
+        "inicio_anterior": inicio_anterior,
+        "fim_anterior": fim_anterior,
+        "dias_calendario_recente": (fim_recente - inicio_recente).days + 1,
+        "dias_calendario_anterior": dias_anterior,
+    }
+
+
+def calcular_tendencia(
+    mov_farmacia: pd.DataFrame,
+    c_mov_cod: str,
+    c_mov_qtd: str,
+    c_mov_tipo: str,
+    data_ini: date,
+    data_fim: date,
+    n_dias: int = JANELA_TENDENCIA_DIAS,
+    coluna_data: str = "dt_formatada",
+) -> pd.DataFrame:
+    """Calcula CMD recente e anterior usando dias ativos da própria farmácia.
+
+    As janelas são dois períodos consecutivos e não sobrepostos de até N dias
+    corridos. Em cada janela, o consumo RM de cada item é dividido pelo número
+    de datas com qualquer movimentação na farmácia, não apenas pelas datas em
+    que o item teve RM.
+    """
+    colunas_saida = [
+        "key", "cmd_tendencia", "qtd_tendencia", "dias_consumo_tendencia",
+        "cmd_anterior", "qtd_anterior", "dias_consumo_anterior",
+    ]
+    if (
+        mov_farmacia is None
+        or mov_farmacia.empty
+        or coluna_data not in mov_farmacia.columns
+        or c_mov_cod not in mov_farmacia.columns
+        or c_mov_qtd not in mov_farmacia.columns
+        or c_mov_tipo not in mov_farmacia.columns
+    ):
+        return pd.DataFrame(columns=colunas_saida)
+
+    janelas = obter_janelas_tendencia(data_ini, data_fim, n_dias)
+    if janelas["inicio_recente"] is None:
+        return pd.DataFrame(columns=colunas_saida)
+
+    mov = mov_farmacia.copy()
+    mov["_data_cmd"] = pd.to_datetime(mov[coluna_data], errors="coerce").dt.date
+    mov = mov[
+        mov["_data_cmd"].notna()
+        & (mov["_data_cmd"] >= data_ini)
+        & (mov["_data_cmd"] <= data_fim)
+    ].copy()
+    if mov.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    mov["_tipo_cmd"] = mov[c_mov_tipo].astype(str).str.strip().str.upper()
+    mov_rm = mov[mov["_tipo_cmd"] == "RM"].copy()
+    if mov_rm.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    mov_rm["_key_cmd"] = mov_rm[c_mov_cod].apply(clean_key)
+    mov_rm["_qtd_cmd"] = p_num_series(mov_rm[c_mov_qtd])
+    mov_rm = mov_rm[mov_rm["_key_cmd"] != ""].copy()
+    if mov_rm.empty:
+        return pd.DataFrame(columns=colunas_saida)
+
+    def _resumir_janela(inicio: date | None, fim: date | None) -> pd.DataFrame:
+        if inicio is None or fim is None or inicio > fim:
+            return pd.DataFrame(columns=["key", "qtd_total", "dias_consumo"])
+
+        janela_mov = mov_rm[
+            (mov_rm["_data_cmd"] >= inicio) & (mov_rm["_data_cmd"] <= fim)
+        ]
+        if janela_mov.empty:
+            return pd.DataFrame(columns=["key", "qtd_total", "dias_consumo"])
+
+        diario = (
+            janela_mov.groupby(["_key_cmd", "_data_cmd"], as_index=False)["_qtd_cmd"]
+            .sum()
+        )
+        qtd = diario.groupby("_key_cmd")["_qtd_cmd"].sum().clip(lower=0)
+        dias_consumo = (
+            diario[diario["_qtd_cmd"] > 0]
+            .groupby("_key_cmd")["_data_cmd"]
+            .nunique()
+        )
+        resumo = pd.DataFrame({"key": qtd.index, "qtd_total": qtd.values})
+        resumo["dias_consumo"] = (
+            resumo["key"].map(dias_consumo).fillna(0).astype(int)
+        )
+        return resumo
+
+    resumo_recente = _resumir_janela(
+        janelas["inicio_recente"], janelas["fim_recente"]
+    )
+    resumo_anterior = _resumir_janela(
+        janelas["inicio_anterior"], janelas["fim_anterior"]
     )
 
-    # 4. Tratamos o resultado matematicamente (vetorizado)
-    n_dias_reais = len(ultimos_n_dias)
-    consumo_tend['cmd_tendencia'] = np.ceil(consumo_tend['qtd_num'] / n_dias_reais).astype(float)
-    
-    return consumo_tend[['key', 'cmd_tendencia']]
+    chaves = sorted(
+        set(resumo_recente["key"].tolist())
+        | set(resumo_anterior["key"].tolist())
+    )
+    if not chaves:
+        return pd.DataFrame(columns=colunas_saida)
+
+    saida = pd.DataFrame({"key": chaves})
+    for sufixo, resumo in (("tendencia", resumo_recente), ("anterior", resumo_anterior)):
+        if resumo.empty:
+            mapa_qtd = {}
+            mapa_dias = {}
+        else:
+            mapa_qtd = resumo.set_index("key")["qtd_total"].to_dict()
+            mapa_dias = resumo.set_index("key")["dias_consumo"].to_dict()
+        saida[f"qtd_{sufixo}"] = saida["key"].map(mapa_qtd).fillna(0.0).astype(float)
+        saida[f"dias_consumo_{sufixo}"] = saida["key"].map(mapa_dias).fillna(0).astype(int)
+
+    dias_ativos_recente = contar_dias_com_movimentacao(
+        mov, coluna_data="_data_cmd",
+        data_ini=janelas["inicio_recente"], data_fim=janelas["fim_recente"],
+    )
+    dias_ativos_anterior = contar_dias_com_movimentacao(
+        mov, coluna_data="_data_cmd",
+        data_ini=janelas["inicio_anterior"], data_fim=janelas["fim_anterior"],
+    ) if janelas["inicio_anterior"] is not None else 0
+
+    saida["cmd_tendencia"] = (
+        saida["qtd_tendencia"] / dias_ativos_recente
+        if dias_ativos_recente > 0 else 0.0
+    )
+    saida["cmd_anterior"] = (
+        saida["qtd_anterior"] / dias_ativos_anterior
+        if dias_ativos_anterior > 0 else 0.0
+    )
+    return saida[colunas_saida]
+
+def calcular_cmd_ajustado(
+    cmd_historico: pd.Series,
+    cmd_recente: pd.Series,
+    dias_historico_corridos: int,
+) -> tuple[pd.Series, pd.Series]:
+    """Combina histórico e tendência sem amplificar artificialmente baixo consumo.
+
+    - CMD histórico < 1 un./dia ativo: 80% histórico + 20% recente limitado entre
+      50% e 200% do histórico.
+    - CMD histórico >= 1 un./dia ativo: 70% histórico + 30% recente.
+    - Período histórico selecionado com menos de 14 dias corridos: não pondera
+      a tendência, para evitar excesso de influência de uma janela recente.
+    - Sem histórico positivo, mas com consumo recente: usa a média recente.
+    """
+    hist = (
+        pd.to_numeric(cmd_historico, errors="coerce")
+        .replace([np.inf, -np.inf], 0)
+        .fillna(0)
+        .clip(lower=0)
+        .astype(float)
+    )
+    recente = (
+        pd.to_numeric(cmd_recente, errors="coerce")
+        .reindex(hist.index)
+        .replace([np.inf, -np.inf], 0)
+        .fillna(0)
+        .clip(lower=0)
+        .astype(float)
+    )
+
+    ajustado = hist.copy()
+    perfil = pd.Series("Sem consumo no período", index=hist.index, dtype="object")
+    sem_historico = hist <= 0
+    tem_recente_sem_historico = sem_historico & (recente > 0)
+
+    if int(dias_historico_corridos) < DIAS_MINIMOS_HISTORICO_TENDENCIA:
+        ajustado.loc[tem_recente_sem_historico] = recente.loc[tem_recente_sem_historico]
+        perfil.loc[hist > 0] = "Histórico curto (sem ajuste de tendência)"
+        perfil.loc[tem_recente_sem_historico] = "Consumo recente sem base histórica"
+        return ajustado.astype(float), perfil
+
+    baixo_consumo = (hist > 0) & (hist < LIMIAR_CMD_BAIXO_CONSUMO)
+    consumo_regular = hist >= LIMIAR_CMD_BAIXO_CONSUMO
+
+    # Limita a tendência de itens de baixo giro para que uma única RM não
+    # multiplique artificialmente a previsão de todo o período.
+    recente_baixo_limitado = recente.clip(
+        lower=hist * 0.5,
+        upper=hist * 2.0,
+    )
+    ajustado.loc[baixo_consumo] = (
+        0.80 * hist.loc[baixo_consumo]
+        + 0.20 * recente_baixo_limitado.loc[baixo_consumo]
+    )
+    ajustado.loc[consumo_regular] = (
+        0.70 * hist.loc[consumo_regular]
+        + 0.30 * recente.loc[consumo_regular]
+    )
+    ajustado.loc[tem_recente_sem_historico] = recente.loc[tem_recente_sem_historico]
+
+    perfil.loc[baixo_consumo] = "Baixo consumo (80% histórico / 20% recente)"
+    perfil.loc[consumo_regular] = "Consumo regular (70% histórico / 30% recente)"
+    perfil.loc[tem_recente_sem_historico] = "Consumo recente sem base histórica"
+
+    return ajustado.astype(float), perfil
 
 
 def calcular_sugestao(row: pd.Series, dias_pedido: int) -> int:
@@ -2326,17 +2647,54 @@ def calcular_cobertura_vetorizado(df: pd.DataFrame) -> pd.Series:
 
 
 def calcular_delta_tendencia(row: pd.Series) -> tuple:
-    cmd_per  = row['Consumo Médio Diário']
-    cmd_tend = row['CMD Últ. 3 dias']
+    """Retorna percentual simples ou uma das situações excepcionais da tendência.
 
-    if cmd_tend == 0 and cmd_per == 0:
-        return "⬜", "Sem dado"
-    if cmd_tend == 0:
-        return "⬜", "Sem dado recente"
-    if cmd_per == 0:
-        return "📈", "+∞%"
+    O percentual compara os CMDs de duas janelas consecutivas, usando os dias
+    ativos da farmácia como denominador. Baixo volume do item é sinalizado com
+    asterisco, sem esconder o percentual calculado.
+    """
+    cmd_anterior = pd.to_numeric(row.get("CMD 7 dias anteriores", 0), errors="coerce")
+    cmd_recente = pd.to_numeric(row.get("CMD Últ. 7 dias", 0), errors="coerce")
+    if pd.isna(cmd_anterior) or not math.isfinite(float(cmd_anterior)):
+        cmd_anterior = 0.0
+    if pd.isna(cmd_recente) or not math.isfinite(float(cmd_recente)):
+        cmd_recente = 0.0
 
-    delta = ((cmd_tend - cmd_per) / cmd_per) * 100
+    dias_cal_recente = row.get("_dias_calendario_recente", JANELA_TENDENCIA_DIAS)
+    dias_cal_anterior = row.get("_dias_calendario_anterior", JANELA_TENDENCIA_DIAS)
+    if (
+        pd.notna(dias_cal_recente) and int(dias_cal_recente) < JANELA_TENDENCIA_DIAS
+    ) or (
+        pd.notna(dias_cal_anterior) and int(dias_cal_anterior) < JANELA_TENDENCIA_DIAS
+    ):
+        return "⬜", "Sem base"
+
+    dias_farm_recente = row.get("_dias_farmacia_recente", None)
+    dias_farm_anterior = row.get("_dias_farmacia_anterior", None)
+    if (
+        pd.isna(dias_farm_recente) or int(dias_farm_recente) == 0
+        or pd.isna(dias_farm_anterior) or int(dias_farm_anterior) == 0
+    ):
+        return "⬜", "Sem base"
+
+    if cmd_anterior <= 0 and cmd_recente <= 0:
+        return "⬜", "Sem consumo"
+    if cmd_anterior <= 0 < cmd_recente:
+        return "📈", "Consumo recente"
+
+    # Se havia consumo anterior e não houve consumo recente, a variação é -100%.
+    delta = ((float(cmd_recente) - float(cmd_anterior)) / float(cmd_anterior)) * 100
+
+    dias_item_recente = row.get("_dias_consumo_recente", 0)
+    dias_item_anterior = row.get("_dias_consumo_anterior", 0)
+    baixo_volume = (
+        pd.notna(dias_item_recente)
+        and int(dias_item_recente) < DIAS_MINIMOS_MOVIMENTO_ITEM_TENDENCIA
+    ) or (
+        pd.notna(dias_item_anterior)
+        and int(dias_item_anterior) < DIAS_MINIMOS_MOVIMENTO_ITEM_TENDENCIA
+    )
+
     if delta > 10:
         emoji = "📈"
     elif delta < -10:
@@ -2345,7 +2703,10 @@ def calcular_delta_tendencia(row: pd.Series) -> tuple:
         emoji = "➡️"
 
     sinal = "+" if delta >= 0 else ""
-    return emoji, f"{sinal}{delta:.0f}%"
+    percentual = f"{sinal}{delta:.0f}%"
+    if baixo_volume:
+        percentual += "*"
+    return emoji, percentual
 
 
 def definir_alerta_e_acao(
@@ -2450,21 +2811,28 @@ def render_painel_pedido_completo() -> None:
     # =================================================================
     if 'df_final_huufma' in st.session_state:
         df_view         = st.session_state['df_final_huufma'].copy()
-        n_dias_efetivos = st.session_state.get('n_dias_efetivos_huufma', '—')
-        datas_vazias    = st.session_state.get('datas_sem_movimento_huufma', [])
+        n_dias_periodo = st.session_state.get(
+            'n_dias_periodo_huufma',
+            st.session_state.get('n_dias_efetivos_huufma', '—'),
+        )
+        dias_corridos_periodo = st.session_state.get(
+            'dias_corridos_periodo_huufma', n_dias_periodo
+        )
+        datas_vazias = st.session_state.get('datas_sem_movimento_huufma', [])
         cod_farmacia_alvo = st.session_state.get('cod_farmacia_alvo', 'Alvo')
 
         if datas_vazias:
             st.warning(
-                f"⚠️ **Auditoria de Calendário:** Sem movimentação em "
-                f"`{len(datas_vazias)}` dia(s) do período: "
-                f"`{', '.join(datas_vazias)}`. "
-                f"O CMD foi calculado com **{n_dias_efetivos} dias efetivos** de movimento."
+                f"⚠️ **Auditoria de calendário:** não houve registro de movimentação em "
+                f"**{len(datas_vazias)} dia(s)** do período ({', '.join(datas_vazias)}). "
+                "Essas datas não entram no denominador do CMD. O CMD histórico foi calculado "
+                f"sobre **{n_dias_periodo} data(s) distinta(s) com movimentação da farmácia**, "
+                f"dentro de **{dias_corridos_periodo} dias corridos selecionados**."
             )
         else:
             st.info(
-                f"✅ **Calendário completo:** Todos os dias do período tiveram movimento. "
-                f"CMD calculado com **{n_dias_efetivos} dias efetivos**."
+                f"✅ **Movimentação registrada em todas as datas do período.** CMD histórico "
+                f"calculado sobre **{n_dias_periodo} data(s) distinta(s) com movimentação da farmácia**."
             )
 
         # ── BADGE RESUMO DE VALIDADES (itens deste pedido com validade crítica) ──
@@ -2505,7 +2873,8 @@ def render_painel_pedido_completo() -> None:
         ordem_cols = [
             'Código MV', 'Material', 'Categoria',
             'Estoque Mínimo', 'Saldo Atual Satélite', '⏰ Validade',
-            'Cobertura (dias)', 'CMD Últ. 3 dias', 'Consumo Médio Diário', COL_SUG,
+            'Cobertura (dias)', 'CMD Histórico', 'CMD Últ. 7 dias',
+            'CMD 7 dias anteriores', 'Consumo Médio Diário', 'Perfil de Consumo', COL_SUG,
             'Tendência', 'Δ% Tendência',
             'Saldo Almox. Centrais Unificado',
             'Parecer Logístico / Alerta', 'Ação Logística Sugerida',
@@ -2513,10 +2882,12 @@ def render_painel_pedido_completo() -> None:
         larguras_rel = {
             'Código MV': 12, 'Material': 45, 'Categoria': 16,
             'Estoque Mínimo': 16, 'Saldo Atual Satélite': 18,
-            'Cobertura (dias)': 14, 'CMD Últ. 3 dias': 16,
-            'Consumo Médio Diário': 18, COL_SUG: 26,
+            'Cobertura (dias)': 14, 'CMD Histórico': 16,
+            'CMD Últ. 7 dias': 16, 'CMD 7 dias anteriores': 20,
+            'Consumo Médio Diário': 18,
+            'Perfil de Consumo': 34, COL_SUG: 26,
             f'PEDIDO ({dias_pedido} DIAS)': 20,
-            'Tendência': 10, 'Δ% Tendência': 12, '⏰ Validade': 18,
+            'Tendência': 10, 'Δ% Tendência': 34, '⏰ Validade': 18,
             'Saldo Almox. Centrais Unificado': 28,
             'Parecer Logístico / Alerta': 26, 'Ação Logística Sugerida': 50,
         }
@@ -2547,10 +2918,13 @@ def render_painel_pedido_completo() -> None:
         )].sort_values('Material')
 
         c0, c1, c2, c3, c4 = st.columns(5)
-        c0.metric("📅 Dias Efetivos de Consumo",
-                  f"{n_dias_efetivos} dias",
-                  delta=f"-{len(datas_vazias)} sem mov." if datas_vazias else "Período completo",
-                  delta_color="inverse" if datas_vazias else "normal")
+        c0.metric(
+            "📅 Dias com movimentação",
+            f"{n_dias_periodo} / {dias_corridos_periodo}",
+            delta=f"{len(datas_vazias)} sem movimento" if datas_vazias else "Todas as datas",
+            delta_color="inverse" if datas_vazias else "normal",
+            help="Conta datas distintas com qualquer movimentação na farmácia. Dias sem registro não entram no denominador do CMD.",
+        )
         with c1:
             st.metric("🚨 Desabastecimento Crítico", f"{len(df_desabast)} itens")
             gerar_download_excel_sob_demanda(
@@ -2721,16 +3095,23 @@ def render_painel_pedido_completo() -> None:
                 "Estoque Mínimo":          st.column_config.NumberColumn("Mínimo", format="%d"),
                 "Saldo Atual Satélite":    st.column_config.NumberColumn("Saldo", format="%d"),
                 "Cobertura (dias)":        st.column_config.TextColumn("Cobertura", width="small"),
-                "CMD Últ. 3 dias":         st.column_config.NumberColumn("CMD 3 dias", format="%d"),                    
-                "Consumo Médio Diário":    st.column_config.NumberColumn("CMD", format="%d"),
-                COL_SUG:                   st.column_config.NumberColumn("Necessidade", format="%d"),                    
+                "CMD Histórico":           st.column_config.NumberColumn("CMD Histórico", format="%.3f"),
+                "CMD Últ. 7 dias":         st.column_config.NumberColumn("CMD 7 dias recentes", format="%.3f"),
+                "CMD 7 dias anteriores":  st.column_config.NumberColumn("CMD 7 dias anteriores", format="%.3f"),
+                "Consumo Médio Diário":    st.column_config.NumberColumn("CMD Ajustado", format="%.3f"),
+                "Perfil de Consumo":       st.column_config.TextColumn("Perfil de Consumo", width="medium"),
+                COL_SUG:                   st.column_config.NumberColumn("Necessidade", format="%d"),
                 "Tendência":               st.column_config.TextColumn("Tend.", width="small"),
-                "Δ% Tendência":            st.column_config.TextColumn("Δ%", width="small"),
+                "Δ% Tendência":            st.column_config.TextColumn("Δ% Tendência", width="small"),
                 "⏰ Validade":              st.column_config.TextColumn("Validade", width="medium"),
                 "Saldo Almox. Centrais Unificado": st.column_config.NumberColumn("Saldo Central", format="%d"),
                 "Parecer Logístico / Alerta": st.column_config.TextColumn("Parecer", width="medium"),
                 "Ação Logística Sugerida":    st.column_config.TextColumn("Ação Sugerida", width="large"),
             }
+        )
+        st.caption(
+            "Tendência: comparação dos últimos 7 dias com os 7 dias anteriores. "
+            "* Percentual calculado com baixo número de datas de consumo do item; interpretar com cautela."
         )
 
         # ── DOWNLOADS ─────────────────────────────────────────────────
@@ -2878,7 +3259,9 @@ with st.sidebar:
 
     ontem       = datetime.now() - timedelta(days=1)
     data_inicio = st.date_input(
-        "Início do Histórico de Consumo:", value=ontem - timedelta(days=6), format="DD/MM/YYYY"
+        "Início do Histórico de Consumo:",
+        value=ontem - timedelta(days=JANELA_HISTORICO_PADRAO_DIAS - 1),
+        format="DD/MM/YYYY",
     )
     data_fim = st.date_input(
         "Fim do Período de Consumo:", value=ontem, format="DD/MM/YYYY"
@@ -2895,11 +3278,11 @@ with st.sidebar:
         ### Matriz de Alertas e Ações Sugeridas
 
         #### 1. ⚪ Sem Consumo
-        * **Condição:** CMD = 0, Estoque Mínimo = 0 e Saldo = 0.
+        * **Condição:** CMD ajustado = 0, Estoque Mínimo = 0 e Saldo = 0.
         * **Ação:** Avaliar inativação do item.
 
         #### 2. 🩵 Estoque Excessivo
-        * **Condição:** CMD > 0 com cobertura > 60 dias.
+        * **Condição:** CMD ajustado > 0 com cobertura > 60 dias.
         * **Ação:** Devolver ao almoxarifado.
 
         #### 3. 🔘 Estoque Parado
@@ -2930,9 +3313,9 @@ with st.sidebar:
         * **Condição:** Sem saldo nas centrais e sem estoque parado nas parceiras.
 
         ---
-        **CMD:** calculado pelos dias com qualquer RM no arquivo (não dias corridos).
+        **CMD histórico:** consumo RM total dividido pela quantidade de datas distintas em que houve qualquer movimentação na farmácia no período selecionado. O denominador não depende do item movimentado nem do tipo de movimento; datas sem registro na base não entram no cálculo. O histórico padrão é de 30 dias corridos.
 
-        **Tendência:** CMD dos últimos 3 dias com movimento vs CMD do período completo.
+        **Tendência:** compara os últimos 7 dias corridos com os 7 dias corridos imediatamente anteriores, sem sobreposição. Em cada janela, o CMD do item é dividido pelos dias em que a farmácia teve qualquer movimentação. Quando a farmácia não teve movimentação em uma das janelas, a comparação é indicada como inconclusiva; percentuais só são exibidos quando há pelo menos 2 datas distintas com RM do item em cada janela. O CMD ajustado combina histórico e tendência: 80%/20% para baixo consumo (com limite de influência recente) e 70%/30% para consumo regular. Com período histórico inferior a 14 dias corridos, a tendência não é ponderada.
 
         ---
         ### Remanejamentos entre farmácias (aba 🔄 Remanejamentos)
@@ -4111,12 +4494,23 @@ with tab3:
                 "📄 Gerar Consolidação Completa (.xlsx)",
                 df_cons,
                 ['Código MV', 'Material', 'Categoria', 'Antimicrobianos', 'Farmácia',
-                 'Saldo Atual', 'CMD', 'Estoque Mínimo', 'Cobertura (dias)',
+                 'Saldo Atual', 'Dias com movimentação no histórico',
+                 'Dias ativos últimos 7 dias', 'Dias ativos 7 dias anteriores',
+                 'CMD Histórico', 'CMD Últ. 7 dias', 'CMD 7 dias anteriores',
+                 'Tendência', 'Δ% Tendência', 'CMD',
+                 'Perfil de Consumo', 'Estoque Mínimo', 'Cobertura (dias)',
                  'Necessidade', 'Saldo Central', 'Parecer'],
                 col_categoria='Farmácia',
                 col_alerta='Parecer',
                 larguras={'Código MV': 12, 'Material': 45, 'Categoria': 16, 'Antimicrobianos': 16,
-                          'Farmácia': 28, 'Saldo Atual': 14, 'CMD': 12,
+                          'Farmácia': 28, 'Saldo Atual': 14,
+                          'Dias com movimentação no histórico': 22,
+                          'Dias ativos últimos 7 dias': 18,
+                          'Dias ativos 7 dias anteriores': 22,
+                          'CMD Histórico': 16,
+                          'CMD Últ. 7 dias': 16, 'CMD 7 dias anteriores': 20,
+                          'Tendência': 10, 'Δ% Tendência': 36,
+                          'CMD': 12, 'Perfil de Consumo': 34,
                           'Estoque Mínimo': 14, 'Cobertura (dias)': 14,
                           'Necessidade': 14, 'Saldo Central': 18, 'Parecer': 28},
                 file_name=f"Consolidacao_{datetime.now().strftime('%d%m%y')}.xlsx",
@@ -4366,7 +4760,6 @@ with tab1:
 
                 # Salvar raws para uso nas abas Validade e Consolidação
                 st.session_state['est_geral_raw']  = est_geral
-                st.session_state['mov_alvo_raw']   = mov
 
                 # Controle de validade integrado à Central de Processamento:
                 # se o usuário anexou o arquivo de validade na Central, ele é processado
@@ -4467,8 +4860,19 @@ with tab1:
                     st.session_state['disparar_processamento_huufma'] = False
                     st.stop()
                 
+                # A análise deve usar somente os movimentos da farmácia detectada.
+                # Isso evita que registros de outro almoxarifado contaminem os dias ativos.
+                mov = mov[mov[c_mov_almox].apply(clean_key) == cod_farmacia_alvo].copy()
+                if mov.empty:
+                    st.error(
+                        "❌ Não há registros válidos para a farmácia identificada no arquivo de movimento."
+                    )
+                    st.session_state['disparar_processamento_huufma'] = False
+                    st.stop()
+
                 st.session_state['cod_farmacia_alvo'] = cod_farmacia_alvo
                 st.session_state['nome_farmacia_alvo'] = DIC_NOMES_FARMACIAS.get(cod_farmacia_alvo, f"Almoxarifado (Cód. {cod_farmacia_alvo})")
+                st.session_state['mov_alvo_raw'] = mov.copy()
 
                 progress.progress(20, text="🏗️ Processando estoque geral...")
 
@@ -4532,16 +4936,22 @@ with tab1:
                         "não foram reconhecidas (formato esperado: AAAA-MM-DD). "
                         "Verifique o formato de exportação do AGHU antes de confiar no CMD."
                     )
-                mov_filtrado = mov[
-                    (mov['dt_formatada'].dt.date >= data_inicio) &
-                    (mov['dt_formatada'].dt.date <= data_fim) &
-                    (mov[c_mov_tipo].astype(str).str.upper() == 'RM')
+
+                # A data ativa é determinada por qualquer registro da farmácia,
+                # independentemente do item ou do tipo de movimento. O consumo
+                # propriamente dito continua sendo apurado somente pelas RM.
+                mov_periodo = mov[
+                    (mov['dt_formatada'].dt.date >= data_inicio)
+                    & (mov['dt_formatada'].dt.date <= data_fim)
+                ].copy()
+                mov_filtrado = mov_periodo[
+                    mov_periodo[c_mov_tipo].astype(str).str.strip().str.upper() == 'RM'
                 ].copy()
 
                 # ── AUDITORIA DE CALENDÁRIO ──────────────────────────────────
-                dias_ideais       = set(pd.date_range(start=data_inicio, end=data_fim).date)
+                dias_ideais = set(pd.date_range(start=data_inicio, end=data_fim).date)
                 dias_com_movimento = sorted(
-                    mov_filtrado['dt_formatada'].dt.date.dropna().unique()
+                    mov_periodo['dt_formatada'].dt.date.dropna().unique()
                 )
                 dias_vazios = sorted(dias_ideais - set(dias_com_movimento))
                 st.session_state['datas_sem_movimento_huufma'] = [
@@ -4549,8 +4959,10 @@ with tab1:
                 ]
                 st.session_state['n_dias_com_movimento'] = len(dias_com_movimento)
 
-                # ── CMD BASEADO NOS DIAS COM MOVIMENTO ───
-                n_dias_efetivos = max(len(dias_com_movimento), 1)
+                # O denominador é o número de datas distintas presentes na base
+                # em que a farmácia teve qualquer movimentação.
+                n_dias_periodo = len(dias_com_movimento)
+                dias_corridos_periodo = len(dias_ideais)
 
                 consumo = (
                     mov_filtrado
@@ -4560,14 +4972,33 @@ with tab1:
                     .reset_index()
                     .rename(columns={'qtd_num': 'total_consumo'})
                 )
-                consumo['cmd'] = consumo['total_consumo'].apply(
-                    lambda x: calcular_cmd(x, n_dias_efetivos)
+                consumo['cmd_historico'] = consumo['total_consumo'].apply(
+                    lambda x: calcular_cmd(x, n_dias_periodo)
                 )
 
-                # ── TENDÊNCIA ─────────────────
+                # ── TENDÊNCIA: ÚLTIMOS 7 DIAS VS. 7 DIAS ANTERIORES ───────────
+                janelas_tendencia = obter_janelas_tendencia(
+                    data_inicio, data_fim, JANELA_TENDENCIA_DIAS
+                )
+                dias_farmacia_tendencia = contar_dias_com_movimentacao(
+                    mov, 'dt_formatada',
+                    janelas_tendencia['inicio_recente'],
+                    janelas_tendencia['fim_recente'],
+                ) if janelas_tendencia['inicio_recente'] is not None else 0
+                dias_farmacia_anterior = contar_dias_com_movimentacao(
+                    mov, 'dt_formatada',
+                    janelas_tendencia['inicio_anterior'],
+                    janelas_tendencia['fim_anterior'],
+                ) if janelas_tendencia['inicio_anterior'] is not None else 0
                 df_tendencia = calcular_tendencia(
-                    mov_filtrado, c_mov_cod, c_mov_qtd,
-                    n_dias=JANELA_TENDENCIA_DIAS
+                    mov,
+                    c_mov_cod,
+                    c_mov_qtd,
+                    c_mov_tipo,
+                    data_ini=data_inicio,
+                    data_fim=data_fim,
+                    n_dias=JANELA_TENDENCIA_DIAS,
+                    coluna_data='dt_formatada',
                 )
 
                 progress.progress(55, text="🔄 Cruzando dados entre farmácias...")
@@ -4658,9 +5089,23 @@ with tab1:
                     est_geral.drop_duplicates(subset=['key'])
                     .set_index('key')[c_est_prod].to_dict()
                 )
-                consumo_map   = consumo.set_index('key')['cmd'].to_dict()
-                tendencia_map = df_tendencia.set_index('key')['cmd_tendencia'].to_dict() \
+                consumo_map = consumo.set_index('key')['cmd_historico'].to_dict()
+                tendencia_map = (
+                    df_tendencia.set_index('key')['cmd_tendencia'].to_dict()
                     if not df_tendencia.empty else {}
+                )
+                tendencia_anterior_map = (
+                    df_tendencia.set_index('key')['cmd_anterior'].to_dict()
+                    if not df_tendencia.empty else {}
+                )
+                dias_consumo_recente_map = (
+                    df_tendencia.set_index('key')['dias_consumo_tendencia'].to_dict()
+                    if not df_tendencia.empty else {}
+                )
+                dias_consumo_anterior_map = (
+                    df_tendencia.set_index('key')['dias_consumo_anterior'].to_dict()
+                    if not df_tendencia.empty else {}
+                )
 
                 todos_codigos = sorted(list(
                     set(est_geral[est_geral['almox_limpo'] == cod_farmacia_alvo]['key'].unique()) |
@@ -4671,18 +5116,40 @@ with tab1:
                 
                 final['Material']              = final['Código MV'].map(mapa_produtos).fillna('PRODUTO SEM DESCRIÇÃO')
                 
-                final['Saldo Atual Satélite']  = final['Código MV'].map(est_farmacia_alvo).fillna(0)
-                final['Consumo Médio Diário']  = final['Código MV'].map(consumo_map).fillna(0)
-                final['Estoque Mínimo']        = final['Código MV'].map(est_min_alvo).fillna(0)
+                final['Saldo Atual Satélite'] = final['Código MV'].map(est_farmacia_alvo).fillna(0)
+                final['CMD Histórico'] = final['Código MV'].map(consumo_map).fillna(0.0)
+                final['CMD Últ. 7 dias'] = final['Código MV'].map(tendencia_map).fillna(0.0)
+                final['CMD 7 dias anteriores'] = final['Código MV'].map(tendencia_anterior_map).fillna(0.0)
+                cmd_ajustado, perfil_consumo = calcular_cmd_ajustado(
+                    final['CMD Histórico'],
+                    final['CMD Últ. 7 dias'],
+                    dias_corridos_periodo,
+                )
+                # Campo legado mantido para compatibilidade com as demais regras:
+                # agora representa o CMD ajustado, sem arredondamento.
+                final['Consumo Médio Diário'] = cmd_ajustado
+                final['Perfil de Consumo'] = perfil_consumo
+                final['Estoque Mínimo'] = final['Código MV'].map(est_min_alvo).fillna(0)
                 final['Necessidade de Ressuprimento'] = calcular_sugestao_vetorizado(final, dias_pedido)
 
                 final['Cobertura (dias)'] = calcular_cobertura_vetorizado(final)
 
-                final['CMD Últ. 3 dias'] = final['Código MV'].map(tendencia_map).fillna(0)
-                # result_type='expand' evita desempacotar tuplas em dois loops extras
+                # Compara os dois períodos consecutivos, usando os dias ativos
+                # da farmácia como denominador e evitando percentuais sem base.
+                final['_dias_consumo_recente'] = final['Código MV'].map(dias_consumo_recente_map).fillna(0)
+                final['_dias_consumo_anterior'] = final['Código MV'].map(dias_consumo_anterior_map).fillna(0)
+                final['_dias_farmacia_recente'] = dias_farmacia_tendencia
+                final['_dias_farmacia_anterior'] = dias_farmacia_anterior
+                final['_dias_calendario_recente'] = janelas_tendencia['dias_calendario_recente']
+                final['_dias_calendario_anterior'] = janelas_tendencia['dias_calendario_anterior']
                 final[['Tendência', 'Δ% Tendência']] = final.apply(
                     calcular_delta_tendencia, axis=1, result_type='expand'
                 )
+                final.drop(columns=[
+                    '_dias_consumo_recente', '_dias_consumo_anterior',
+                    '_dias_farmacia_recente', '_dias_farmacia_anterior',
+                    '_dias_calendario_recente', '_dias_calendario_anterior',
+                ], inplace=True)
 
                 mapa_cat = obter_mapa_categorias()
                 mapa_antimicrobianos = obter_mapa_antimicrobianos()
@@ -4732,7 +5199,8 @@ with tab1:
                         final['⏰ Validade'] = final['Código MV'].map(mapa_val).fillna("—")
 
                 st.session_state['df_final_huufma']        = final
-                st.session_state['n_dias_efetivos_huufma'] = n_dias_efetivos
+                st.session_state['n_dias_periodo_huufma'] = n_dias_periodo
+                st.session_state['dias_corridos_periodo_huufma'] = dias_corridos_periodo
                 st.session_state['disparar_processamento_huufma'] = False
                 progress.progress(100, text="✅ Processamento concluído!")
                 st.rerun()
